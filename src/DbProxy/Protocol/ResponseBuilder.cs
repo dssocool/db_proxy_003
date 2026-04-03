@@ -275,6 +275,12 @@ public sealed class ResponseBuilder
                 else if (row["NumericScale"] is int ns2) scale = (byte)ns2;
             }
 
+            if (typeName == "sql_variant")
+            {
+                _logger.LogDebug("  sql_variant column '{Name}': GetFieldType={ClrType} columnSize={ColSize}",
+                    reader.GetName(i), clrType.Name, columnSize);
+            }
+
             var (tdsType, maxLen, isVarLen, needsCollation) = MapToTdsType(typeName, clrType, columnSize, precision);
 
             cols[i] = new ColumnInfo
@@ -327,7 +333,7 @@ public sealed class ResponseBuilder
                 (TdsConstants.TypeBigVarBin, columnSize > 0 && columnSize <= 8000 ? columnSize : 8000, true, false),
             "image" => (TdsConstants.TypeBigVarBin, 8000, true, false),
             "xml" => (TdsConstants.TypeNVarChar, 8000, true, true),
-            "sql_variant" => (TdsConstants.TypeNVarChar, 8000, true, true),
+            "sql_variant" => MapFromClrType(clrType),
             _ => MapFromClrType(clrType),
         };
     }
