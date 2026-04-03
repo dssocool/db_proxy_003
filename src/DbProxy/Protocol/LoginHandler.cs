@@ -106,8 +106,8 @@ public sealed class LoginHandler
         // Interface: 1 = SQL_TSQL
         tw.Write((byte)1);
 
-        // TDS Version 7.4 as little-endian DWORD
-        tw.Write(TdsConstants.TdsVersion74);
+        // TDS Version 7.4 — LOGINACK uses big-endian byte order
+        tw.Write(TdsConstants.TdsVersion74LoginAck);
 
         // Server program name as B_VARCHAR (length-prefixed byte, then UTF-16LE)
         string progName = "DbProxy";

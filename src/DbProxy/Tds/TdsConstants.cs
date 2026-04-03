@@ -6,7 +6,10 @@ public static class TdsConstants
     public const int DefaultPacketSize = 4096;
     public const int MaxPacketSize = 32767;
 
-    public static readonly byte[] TdsVersion74 = [0x04, 0x00, 0x00, 0x74];
+    // LOGIN7 (client->server) uses little-endian: 04 00 00 74
+    public static readonly byte[] TdsVersion74LoginRequest = [0x04, 0x00, 0x00, 0x74];
+    // LOGINACK (server->client) uses big-endian: 74 00 00 04
+    public static readonly byte[] TdsVersion74LoginAck = [0x74, 0x00, 0x00, 0x04];
 
     // Packet types
     public const byte PacketTypeSqlBatch = 0x01;
