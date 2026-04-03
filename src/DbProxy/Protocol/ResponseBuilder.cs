@@ -421,19 +421,28 @@ public sealed class ResponseBuilder
     private void WriteRow(BinaryWriter bw, SqlDataReader reader, ColumnInfo[] columns)
     {
         bw.Write(TdsConstants.TokenRow);
+        long rowStartPos = bw.BaseStream.Position;
 
         for (int i = 0; i < columns.Length; i++)
         {
             var col = columns[i];
+            long colStartPos = bw.BaseStream.Position;
 
             if (reader.IsDBNull(i))
             {
                 WriteNullValue(bw, col);
+                _logger.LogDebug("    Col[{Idx}] {Name}: NULL ({ByteCount} bytes written)",
+                    i, col.Name, bw.BaseStream.Position - colStartPos);
                 continue;
             }
 
+            object rawValue = reader.GetValue(i);
             WriteColumnValue(bw, reader, i, col);
+            _logger.LogDebug("    Col[{Idx}] {Name}: value={Value} clrType={ClrType} ({ByteCount} bytes written)",
+                i, col.Name, rawValue, rawValue?.GetType().Name ?? "null", bw.BaseStream.Position - colStartPos);
         }
+
+        _logger.LogDebug("  ROW total data: {Bytes} bytes", bw.BaseStream.Position - rowStartPos);
     }
 
     private static void WriteNullValue(BinaryWriter bw, ColumnInfo col)

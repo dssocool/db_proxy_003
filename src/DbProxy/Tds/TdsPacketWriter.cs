@@ -68,9 +68,9 @@ public sealed class TdsPacketWriter
 
         if (_logger?.IsEnabled(LogLevel.Debug) == true && payload.Length > 0)
         {
-            int dumpLen = Math.Min(payload.Length, 128);
-            _logger.LogDebug("  Write payload ({PayloadLen} bytes, showing first {DumpLen}): {Hex}",
-                payload.Length, dumpLen, BitConverter.ToString(payload.Span[..dumpLen].ToArray()));
+            int dumpLen = Math.Min(payload.Length, 2048);
+            _logger.LogDebug("  Write payload ({PayloadLen} bytes): {Hex}",
+                payload.Length, BitConverter.ToString(payload.Span[..dumpLen].ToArray()));
         }
 
         await _stream.WriteAsync(headerBytes, ct);
