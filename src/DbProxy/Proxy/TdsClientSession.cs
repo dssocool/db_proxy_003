@@ -248,6 +248,8 @@ public sealed class TdsClientSession : IAsyncDisposable
         byte[] response = await _responseBuilder.BuildResponseFromCommandAsync(cmd, ct);
         _logger.LogDebug("Response built: {Len} bytes", response.Length);
         await _writer.WriteMessageAsync(TdsConstants.PacketTypeTabularResult, response, ct);
+        _logger.LogDebug("Response flushed to client. Socket connected={Connected} DataAvailable={DataAvailable}",
+            _client.Connected, _stream.DataAvailable);
     }
 
     private async Task SendDoneAsync(ushort status, long rowCount, CancellationToken ct)

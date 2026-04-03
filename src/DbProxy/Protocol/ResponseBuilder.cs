@@ -327,6 +327,7 @@ public sealed class ResponseBuilder
                 (TdsConstants.TypeBigVarBin, columnSize > 0 && columnSize <= 8000 ? columnSize : 8000, true, false),
             "image" => (TdsConstants.TypeBigVarBin, 8000, true, false),
             "xml" => (TdsConstants.TypeNVarChar, 8000, true, true),
+            "sql_variant" => (TdsConstants.TypeNVarChar, 8000, true, true),
             _ => MapFromClrType(clrType),
         };
     }

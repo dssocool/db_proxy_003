@@ -77,6 +77,7 @@ public sealed class LoginHandler
 
         WriteLoginAckToken(bw);
         WriteEnvChangeDatabase(bw, database);
+        WriteEnvChangeCollation(bw);
         WriteEnvChangePacketSize(bw, packetSize);
         WriteEnvChangeLanguage(bw);
         WriteDoneToken(bw, TdsConstants.DoneFinal, 0);
@@ -161,6 +162,26 @@ public sealed class LoginHandler
         tw.Write(Encoding.Unicode.GetBytes(newVal));
         tw.Write((byte)oldVal.Length);
         tw.Write(Encoding.Unicode.GetBytes(oldVal));
+
+        byte[] tokenData = tokenMs.ToArray();
+        bw.Write(TdsConstants.TokenEnvChange);
+        bw.Write((ushort)tokenData.Length);
+        bw.Write(tokenData);
+    }
+
+    private static void WriteEnvChangeCollation(BinaryWriter bw)
+    {
+        using var tokenMs = new MemoryStream();
+        using var tw = new BinaryWriter(tokenMs, Encoding.Unicode, leaveOpen: true);
+
+        tw.Write(TdsConstants.EnvCollation);
+
+        // New collation value: 5 bytes raw collation (same as DefaultCollation)
+        tw.Write((byte)5);
+        tw.Write(TdsConstants.DefaultCollation);
+
+        // Old collation: empty
+        tw.Write((byte)0);
 
         byte[] tokenData = tokenMs.ToArray();
         bw.Write(TdsConstants.TokenEnvChange);
