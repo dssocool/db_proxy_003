@@ -102,7 +102,138 @@ public sealed class ResponseBuilder
             LoginHandler.WriteDoneToken(bw, (ushort)(TdsConstants.DoneError | TdsConstants.DoneFinal), 0);
         }
 
-        return ms.ToArray();
+        var result = ms.ToArray();
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug("=== Full response token stream ({Len} bytes) ===", result.Length);
+            DumpTokenStream(result);
+            _logger.LogDebug("=== End token stream dump ===");
+        }
+
+        return result;
+    }
+
+    private void DumpTokenStream(byte[] data)
+    {
+        int offset = 0;
+        while (offset < data.Length)
+        {
+            byte token = data[offset];
+            string tokenName = token switch
+            {
+                TdsConstants.TokenColMetadata => "COLMETADATA",
+                TdsConstants.TokenRow => "ROW",
+                TdsConstants.TokenDone => "DONE",
+                TdsConstants.TokenDoneProc => "DONEPROC",
+                TdsConstants.TokenDoneInProc => "DONEINPROC",
+                TdsConstants.TokenError => "ERROR",
+                TdsConstants.TokenInfo => "INFO",
+                TdsConstants.TokenLoginAck => "LOGINACK",
+                TdsConstants.TokenEnvChange => "ENVCHANGE",
+                TdsConstants.TokenOrder => "ORDER",
+                _ => $"UNKNOWN(0x{token:X2})",
+            };
+
+            if (token == TdsConstants.TokenDone || token == TdsConstants.TokenDoneProc || token == TdsConstants.TokenDoneInProc)
+            {
+                if (offset + 13 <= data.Length)
+                {
+                    ushort status = BitConverter.ToUInt16(data, offset + 1);
+                    ushort curCmd = BitConverter.ToUInt16(data, offset + 3);
+                    long rowCount = BitConverter.ToInt64(data, offset + 5);
+                    _logger.LogDebug("  @{Offset}: {Token} status=0x{Status:X4} curCmd={CurCmd} rowCount={RowCount}",
+                        offset, tokenName, status, curCmd, rowCount);
+                    offset += 13;
+                }
+                else
+                {
+                    _logger.LogDebug("  @{Offset}: {Token} (truncated, only {Remain} bytes left)",
+                        offset, tokenName, data.Length - offset);
+                    break;
+                }
+            }
+            else if (token == TdsConstants.TokenColMetadata)
+            {
+                if (offset + 3 <= data.Length)
+                {
+                    ushort colCount = BitConverter.ToUInt16(data, offset + 1);
+                    _logger.LogDebug("  @{Offset}: {Token} columns={ColCount}", offset, tokenName, colCount);
+                    // Skip past COLMETADATA — scan for next known token
+                    offset = ScanForNextToken(data, offset + 3);
+                }
+                else
+                {
+                    break;
+                }
+            }
+            else if (token == TdsConstants.TokenRow)
+            {
+                _logger.LogDebug("  @{Offset}: {Token}", offset, tokenName);
+                offset = ScanForNextToken(data, offset + 1);
+            }
+            else if (token == TdsConstants.TokenError || token == TdsConstants.TokenInfo
+                     || token == TdsConstants.TokenLoginAck || token == TdsConstants.TokenEnvChange
+                     || token == TdsConstants.TokenOrder)
+            {
+                if (offset + 3 <= data.Length)
+                {
+                    ushort len = BitConverter.ToUInt16(data, offset + 1);
+                    _logger.LogDebug("  @{Offset}: {Token} length={Len}", offset, tokenName, len);
+                    offset += 3 + len;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            else
+            {
+                _logger.LogDebug("  @{Offset}: UNKNOWN token 0x{Token:X2}, stopping dump", offset, token);
+                break;
+            }
+        }
+    }
+
+    private static int ScanForNextToken(byte[] data, int start)
+    {
+        byte[] knownTokens = [
+            TdsConstants.TokenColMetadata, TdsConstants.TokenRow,
+            TdsConstants.TokenDone, TdsConstants.TokenDoneProc, TdsConstants.TokenDoneInProc,
+            TdsConstants.TokenError, TdsConstants.TokenInfo,
+            TdsConstants.TokenLoginAck, TdsConstants.TokenEnvChange, TdsConstants.TokenOrder,
+        ];
+
+        for (int i = start; i < data.Length; i++)
+        {
+            if (Array.IndexOf(knownTokens, data[i]) >= 0)
+            {
+                if (data[i] == TdsConstants.TokenDone || data[i] == TdsConstants.TokenDoneProc || data[i] == TdsConstants.TokenDoneInProc)
+                {
+                    if (i + 13 <= data.Length)
+                        return i;
+                }
+                else if (data[i] == TdsConstants.TokenColMetadata)
+                {
+                    if (i + 3 <= data.Length)
+                        return i;
+                }
+                else if (data[i] == TdsConstants.TokenRow)
+                {
+                    return i;
+                }
+                else
+                {
+                    if (i + 3 <= data.Length)
+                    {
+                        ushort len = BitConverter.ToUInt16(data, i + 1);
+                        if (i + 3 + len <= data.Length)
+                            return i;
+                    }
+                }
+            }
+        }
+        return data.Length;
     }
 
     private sealed class ColumnInfo
