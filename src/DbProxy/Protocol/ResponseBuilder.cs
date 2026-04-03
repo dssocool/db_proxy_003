@@ -30,12 +30,21 @@ public sealed class ResponseBuilder
         try
         {
             using var reader = await cmd.ExecuteReaderAsync(ct);
+            int resultSetIndex = 0;
 
             do
             {
+                resultSetIndex++;
+                bool hasMoreResults = false;
+
                 if (reader.FieldCount > 0)
                 {
                     var colInfos = BuildColumnInfos(reader);
+                    _logger.LogDebug("ResultSet #{Idx}: {ColCount} columns", resultSetIndex, colInfos.Length);
+                    for (int c = 0; c < colInfos.Length; c++)
+                        _logger.LogDebug("  Col[{Idx}]: {Name} ({TypeName}, TdsType=0x{TdsType:X2}, MaxLen={MaxLen})",
+                            c, colInfos[c].Name, colInfos[c].DataTypeName, colInfos[c].TdsTypeId, colInfos[c].MaxLength);
+
                     WriteColMetadata(bw, colInfos);
 
                     long rowCount = 0;
@@ -44,22 +53,39 @@ public sealed class ResponseBuilder
                         WriteRow(bw, reader, colInfos);
                         rowCount++;
                     }
+                    _logger.LogDebug("ResultSet #{Idx}: {RowCount} rows written", resultSetIndex, rowCount);
 
-                    ushort doneStatus = TdsConstants.DoneCount;
-                    if (!reader.HasRows)
-                        doneStatus = TdsConstants.DoneFinal;
+                    hasMoreResults = await reader.NextResultAsync(ct);
+
+                    ushort doneStatus = (ushort)(TdsConstants.DoneCount
+                        | (hasMoreResults ? TdsConstants.DoneMore : 0));
                     LoginHandler.WriteDoneToken(bw, doneStatus, rowCount);
+                    _logger.LogDebug("ResultSet #{Idx}: DONE token status=0x{Status:X4} rowCount={RowCount} hasMore={More}",
+                        resultSetIndex, doneStatus, rowCount, hasMoreResults);
                 }
                 else
                 {
                     int affected = reader.RecordsAffected;
-                    ushort status = (ushort)(TdsConstants.DoneFinal | (affected >= 0 ? TdsConstants.DoneCount : 0));
-                    LoginHandler.WriteDoneToken(bw, status, affected >= 0 ? affected : 0);
-                }
-            } while (await reader.NextResultAsync(ct));
+                    _logger.LogDebug("ResultSet #{Idx}: non-query, RecordsAffected={Affected}", resultSetIndex, affected);
 
-            // Final DONE
+                    hasMoreResults = await reader.NextResultAsync(ct);
+
+                    ushort status = (ushort)(
+                        (hasMoreResults ? TdsConstants.DoneMore : 0)
+                        | (affected >= 0 ? TdsConstants.DoneCount : 0));
+                    LoginHandler.WriteDoneToken(bw, status, affected >= 0 ? affected : 0);
+                    _logger.LogDebug("ResultSet #{Idx}: DONE token status=0x{Status:X4} hasMore={More}",
+                        resultSetIndex, status, hasMoreResults);
+                }
+
+                if (!hasMoreResults)
+                    break;
+
+            } while (true);
+
             LoginHandler.WriteDoneToken(bw, TdsConstants.DoneFinal, 0);
+            _logger.LogDebug("Final DONE token written (status=0x{Status:X4}). Total result sets: {Count}",
+                TdsConstants.DoneFinal, resultSetIndex);
         }
         catch (SqlException ex)
         {
