@@ -14,7 +14,7 @@ configuration.GetSection("Proxy").Bind(config);
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
     builder.AddConsole();
-    builder.SetMinimumLevel(LogLevel.Information);
+    builder.SetMinimumLevel(LogLevel.Debug);
 });
 
 var logger = loggerFactory.CreateLogger("DbProxy");

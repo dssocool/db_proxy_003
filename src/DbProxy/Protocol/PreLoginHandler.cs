@@ -22,24 +22,77 @@ public sealed class PreLoginHandler
         byte clientEncryption = TdsConstants.EncryptNotSup;
         int offset = 0;
 
+        _logger.LogDebug("Parsing client PRELOGIN ({Len} bytes)", payload.Length);
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            int dumpLen = Math.Min(payload.Length, 256);
+            _logger.LogDebug("  PRELOGIN hex dump (first {DumpLen} bytes): {Hex}",
+                dumpLen, BitConverter.ToString(payload[..dumpLen].ToArray()));
+        }
+
         while (offset < payload.Length)
         {
             byte token = payload[offset];
             if (token == TdsConstants.PreLoginTerminator)
+            {
+                _logger.LogDebug("  Option: TERMINATOR at offset {Offset}", offset);
                 break;
+            }
 
             if (offset + 4 >= payload.Length)
+            {
+                _logger.LogWarning("  Truncated option header at offset {Offset}", offset);
                 break;
+            }
 
             ushort dataOffset = BinaryPrimitives.ReadUInt16BigEndian(payload[(offset + 1)..]);
             ushort dataLength = BinaryPrimitives.ReadUInt16BigEndian(payload[(offset + 3)..]);
-            offset += 5;
+
+            string tokenName = PreLoginTokenName(token);
+            _logger.LogDebug("  Option: {Token}(0x{TokenHex:X2}) DataOffset={DataOff} DataLength={DataLen}",
+                tokenName, token, dataOffset, dataLength);
+
+            if (dataOffset < payload.Length && dataLength > 0)
+            {
+                int safeLen = Math.Min(dataLength, payload.Length - dataOffset);
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    _logger.LogDebug("    Data: {Hex}",
+                        BitConverter.ToString(payload.Slice(dataOffset, safeLen).ToArray()));
+                }
+
+                if (token == TdsConstants.PreLoginVersion && safeLen >= 6)
+                {
+                    byte major = payload[dataOffset];
+                    byte minor = payload[dataOffset + 1];
+                    ushort build = BinaryPrimitives.ReadUInt16BigEndian(payload[(dataOffset + 2)..]);
+                    ushort subBuild = BinaryPrimitives.ReadUInt16BigEndian(payload[(dataOffset + 4)..]);
+                    _logger.LogDebug("    Client TDS Version: {Major}.{Minor}.{Build}.{SubBuild}", major, minor, build, subBuild);
+                }
+            }
 
             if (token == TdsConstants.PreLoginEncryption && dataLength >= 1 && dataOffset < payload.Length)
             {
                 clientEncryption = payload[dataOffset];
-                _logger.LogDebug("Client requested encryption: 0x{Enc:X2}", clientEncryption);
+                string encName = clientEncryption switch
+                {
+                    TdsConstants.EncryptOff => "ENCRYPT_OFF",
+                    TdsConstants.EncryptOn => "ENCRYPT_ON",
+                    TdsConstants.EncryptNotSup => "ENCRYPT_NOT_SUP",
+                    TdsConstants.EncryptRequired => "ENCRYPT_REQ",
+                    _ => $"UNKNOWN(0x{clientEncryption:X2})",
+                };
+                _logger.LogDebug("    Client requested encryption: {EncName} (0x{Enc:X2})", encName, clientEncryption);
+
+                if (clientEncryption == TdsConstants.EncryptOn || clientEncryption == TdsConstants.EncryptRequired)
+                {
+                    _logger.LogWarning("    Client requires encryption (0x{Enc:X2}) but proxy does not support TLS. " +
+                        "The client (SSMS) may hang or fail after PRELOGIN if it expects a TLS handshake.", clientEncryption);
+                }
             }
+
+            offset += 5;
         }
 
         return clientEncryption;
@@ -51,13 +104,9 @@ public sealed class PreLoginHandler
     /// </summary>
     public byte[] BuildServerPreLoginResponse()
     {
-        // Option entries: VERSION, ENCRYPTION, INSTOPT, THREADID, MARS, TERMINATOR
-        // Each option header = 5 bytes (token + offset + length), terminator = 1 byte
-        // 5 options * 5 bytes + 1 terminator = 26 bytes of option headers
         const int optionCount = 5;
         const int optionHeaderSize = optionCount * 5 + 1;
 
-        // Data sizes: VERSION=6, ENCRYPTION=1, INSTOPT=1, THREADID=4, MARS=1
         const int versionLen = 6;
         const int encryptionLen = 1;
         const int instOptLen = 1;
@@ -79,7 +128,6 @@ public sealed class PreLoginHandler
             headerPos += 2;
         }
 
-        // VERSION: 15.0.0.0 (SQL Server 2019-ish) + sub-build 0
         WriteOption(TdsConstants.PreLoginVersion, versionLen);
         buf[dataPos++] = 15;
         buf[dataPos++] = 0;
@@ -88,27 +136,40 @@ public sealed class PreLoginHandler
         BinaryPrimitives.WriteUInt16BigEndian(buf.AsSpan(dataPos), 0);
         dataPos += 2;
 
-        // ENCRYPTION: NOT_SUP
         WriteOption(TdsConstants.PreLoginEncryption, encryptionLen);
         buf[dataPos++] = TdsConstants.EncryptNotSup;
 
-        // INSTOPT: single null byte
         WriteOption(TdsConstants.PreLoginInstOpt, instOptLen);
         buf[dataPos++] = 0x00;
 
-        // THREADID: 0
         WriteOption(TdsConstants.PreLoginThreadId, threadIdLen);
         BinaryPrimitives.WriteUInt32BigEndian(buf.AsSpan(dataPos), 0);
         dataPos += 4;
 
-        // MARS: not supported
         WriteOption(TdsConstants.PreLoginMars, marsLen);
         buf[dataPos++] = 0x00;
 
-        // TERMINATOR
         buf[headerPos] = TdsConstants.PreLoginTerminator;
 
-        _logger.LogDebug("Built server PRELOGIN response ({Len} bytes)", totalLen);
+        _logger.LogDebug("Built server PRELOGIN response ({Len} bytes): VERSION=15.0 ENCRYPTION=NOT_SUP MARS=off", totalLen);
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug("  PRELOGIN response hex: {Hex}", BitConverter.ToString(buf));
+        }
+
         return buf;
     }
+
+    private static string PreLoginTokenName(byte token) => token switch
+    {
+        TdsConstants.PreLoginVersion => "VERSION",
+        TdsConstants.PreLoginEncryption => "ENCRYPTION",
+        TdsConstants.PreLoginInstOpt => "INSTOPT",
+        TdsConstants.PreLoginThreadId => "THREADID",
+        TdsConstants.PreLoginMars => "MARS",
+        TdsConstants.PreLoginTraceId => "TRACEID",
+        TdsConstants.PreLoginFedAuthRequired => "FEDAUTHREQUIRED",
+        TdsConstants.PreLoginTerminator => "TERMINATOR",
+        _ => $"UNKNOWN(0x{token:X2})",
+    };
 }
