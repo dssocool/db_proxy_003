@@ -218,6 +218,20 @@ public sealed class LoginHandler
     internal static void WriteErrorToken(BinaryWriter bw, int number, byte severity, byte state,
         string message, string serverName, string procName, int lineNumber)
     {
+        WriteMessageToken(bw, TdsConstants.TokenError, number, severity, state,
+            message, serverName, procName, lineNumber);
+    }
+
+    internal static void WriteInfoToken(BinaryWriter bw, int number, byte severity, byte state,
+        string message, string serverName, string procName, int lineNumber)
+    {
+        WriteMessageToken(bw, TdsConstants.TokenInfo, number, severity, state,
+            message, serverName, procName, lineNumber);
+    }
+
+    private static void WriteMessageToken(BinaryWriter bw, byte tokenType, int number, byte severity, byte state,
+        string message, string serverName, string procName, int lineNumber)
+    {
         using var tokenMs = new MemoryStream();
         using var tw = new BinaryWriter(tokenMs, Encoding.Unicode, leaveOpen: true);
 
@@ -225,24 +239,20 @@ public sealed class LoginHandler
         tw.Write(state);
         tw.Write(severity);
 
-        // Message text: US_VARCHAR = ushort length (chars) + UTF-16LE
         tw.Write((ushort)message.Length);
         tw.Write(Encoding.Unicode.GetBytes(message));
 
-        // Server name
         tw.Write((byte)serverName.Length);
         tw.Write(Encoding.Unicode.GetBytes(serverName));
 
-        // Proc name
         tw.Write((byte)procName.Length);
         if (procName.Length > 0)
             tw.Write(Encoding.Unicode.GetBytes(procName));
 
-        // Line number (DWORD for TDS 7.2+)
         tw.Write(lineNumber);
 
         byte[] tokenData = tokenMs.ToArray();
-        bw.Write(TdsConstants.TokenError);
+        bw.Write(tokenType);
         bw.Write((ushort)tokenData.Length);
         bw.Write(tokenData);
     }

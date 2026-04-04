@@ -1788,7 +1788,8 @@ public static class SqlClientTests
         {
             var sb = new StringBuilder();
             sb.AppendLine(FormatSqlError(ex));
-            AssertSqlError(ex, new[] { 156 }, name, sb);
+            try { AssertSqlError(ex, new[] { 156 }, name, sb); }
+            catch { results.Add((name, false, sb.ToString().TrimEnd(), $"Wrong error number: got {ex.Number}")); Console.WriteLine($"  [FAIL] {name}: Wrong error number: got {ex.Number}"); return; }
             results.Add((name, true, sb.ToString().TrimEnd(), null));
             Console.WriteLine($"  [PASS] {name} (expected error {ex.Number})");
         }
@@ -1815,7 +1816,8 @@ public static class SqlClientTests
         {
             var sb = new StringBuilder();
             sb.AppendLine(FormatSqlError(ex));
-            AssertSqlError(ex, new[] { 245 }, name, sb);
+            try { AssertSqlError(ex, new[] { 245 }, name, sb); }
+            catch { results.Add((name, false, sb.ToString().TrimEnd(), $"Wrong error number: got {ex.Number}")); Console.WriteLine($"  [FAIL] {name}: Wrong error number: got {ex.Number}"); return; }
             results.Add((name, true, sb.ToString().TrimEnd(), null));
             Console.WriteLine($"  [PASS] {name} (expected error {ex.Number})");
         }
@@ -1843,7 +1845,8 @@ public static class SqlClientTests
         {
             var sb = new StringBuilder();
             sb.AppendLine(FormatSqlError(ex));
-            AssertSqlError(ex, new[] { 2627 }, name, sb);
+            try { AssertSqlError(ex, new[] { 2627 }, name, sb); }
+            catch { results.Add((name, false, sb.ToString().TrimEnd(), $"Wrong error number: got {ex.Number}")); Console.WriteLine($"  [FAIL] {name}: Wrong error number: got {ex.Number}"); return; }
             results.Add((name, true, sb.ToString().TrimEnd(), null));
             Console.WriteLine($"  [PASS] {name} (expected error {ex.Number})");
         }
@@ -1871,7 +1874,8 @@ public static class SqlClientTests
         {
             var sb = new StringBuilder();
             sb.AppendLine(FormatSqlError(ex));
-            AssertSqlError(ex, new[] { 547 }, name, sb);
+            try { AssertSqlError(ex, new[] { 547 }, name, sb); }
+            catch { results.Add((name, false, sb.ToString().TrimEnd(), $"Wrong error number: got {ex.Number}")); Console.WriteLine($"  [FAIL] {name}: Wrong error number: got {ex.Number}"); return; }
             results.Add((name, true, sb.ToString().TrimEnd(), null));
             Console.WriteLine($"  [PASS] {name} (expected error {ex.Number})");
         }
@@ -1899,7 +1903,8 @@ public static class SqlClientTests
         {
             var sb = new StringBuilder();
             sb.AppendLine(FormatSqlError(ex));
-            AssertSqlError(ex, new[] { -2 }, name, sb);
+            try { AssertSqlError(ex, new[] { -2 }, name, sb); }
+            catch { results.Add((name, false, sb.ToString().TrimEnd(), $"Wrong error number: got {ex.Number}")); Console.WriteLine($"  [FAIL] {name}: Wrong error number: got {ex.Number}"); return; }
             results.Add((name, true, sb.ToString().TrimEnd(), null));
             Console.WriteLine($"  [PASS] {name} (expected error {ex.Number})");
         }
@@ -1944,7 +1949,8 @@ public static class SqlClientTests
                 {
                     var sb2 = new StringBuilder();
                     sb2.AppendLine(FormatSqlError(sqlEx));
-                    AssertSqlError(sqlEx, new[] { 0 }, name, sb2);
+                    try { AssertSqlError(sqlEx, new[] { 0 }, name, sb2); }
+                    catch { results.Add((name, false, sb2.ToString().TrimEnd(), $"Wrong error number: got {sqlEx.Number}")); Console.WriteLine($"  [FAIL] {name}: Wrong error number: got {sqlEx.Number}"); return; }
                     results.Add((name, true, sb2.ToString().TrimEnd(), null));
                     Console.WriteLine($"  [PASS] {name} (canceled, error {sqlEx.Number})");
                     return;
@@ -1965,7 +1971,8 @@ public static class SqlClientTests
         {
             var sb = new StringBuilder();
             sb.AppendLine(FormatSqlError(ex));
-            AssertSqlError(ex, new[] { 0 }, name, sb);
+            try { AssertSqlError(ex, new[] { 0 }, name, sb); }
+            catch { results.Add((name, false, sb.ToString().TrimEnd(), $"Wrong error number: got {ex.Number}")); Console.WriteLine($"  [FAIL] {name}: Wrong error number: got {ex.Number}"); return; }
             results.Add((name, true, sb.ToString().TrimEnd(), null));
             Console.WriteLine($"  [PASS] {name} (canceled, error {ex.Number})");
         }
@@ -2703,8 +2710,8 @@ public static class SqlClientTests
         try
         {
             var sb = new StringBuilder();
-            string marsConn = connStr + "MultipleActiveResultSets=true;";
-            using var conn = new SqlConnection(marsConn);
+            var marsBuilder = new SqlConnectionStringBuilder(connStr) { MultipleActiveResultSets = true };
+            using var conn = new SqlConnection(marsBuilder.ConnectionString);
             conn.Open();
 
             using var cmd1 = new SqlCommand(
@@ -2736,8 +2743,8 @@ public static class SqlClientTests
         try
         {
             var sb = new StringBuilder();
-            string marsConn = connStr + "MultipleActiveResultSets=true;";
-            using var conn = new SqlConnection(marsConn);
+            var marsBuilder = new SqlConnectionStringBuilder(connStr) { MultipleActiveResultSets = true };
+            using var conn = new SqlConnection(marsBuilder.ConnectionString);
             conn.Open();
 
             ExecNonQuery(conn, $"DELETE FROM [{DmlTableName}] WHERE Id = 9801");
@@ -2774,8 +2781,8 @@ public static class SqlClientTests
         try
         {
             var sb = new StringBuilder();
-            string marsConn = connStr + "MultipleActiveResultSets=true;";
-            using var conn = new SqlConnection(marsConn);
+            var marsBuilder = new SqlConnectionStringBuilder(connStr) { MultipleActiveResultSets = true };
+            using var conn = new SqlConnection(marsBuilder.ConnectionString);
             conn.Open();
 
             using var cmd1 = new SqlCommand(

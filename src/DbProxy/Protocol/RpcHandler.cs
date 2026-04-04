@@ -154,6 +154,14 @@ public sealed class RpcHandler
         cmd.CommandType = CommandType.StoredProcedure;
         cmd.CommandTimeout = 120;
 
+        var retValParam = new SqlParameter
+        {
+            ParameterName = "@__ReturnValue",
+            SqlDbType = SqlDbType.Int,
+            Direction = ParameterDirection.ReturnValue,
+        };
+        cmd.Parameters.Add(retValParam);
+
         for (int i = 0; i < rpc.Parameters.Count; i++)
         {
             var p = rpc.Parameters[i];
@@ -277,25 +285,212 @@ public sealed class RpcHandler
 
     internal static void WriteReturnValueInt(BinaryWriter bw, string paramName, int value)
     {
+        WriteReturnValue(bw, paramName, 0, value, typeof(int));
+    }
+
+    internal static void WriteReturnValue(BinaryWriter bw, string paramName, ushort ordinal, object? value, Type clrType)
+    {
         bw.Write(TdsConstants.TokenReturnValue);
 
         using var tokenMs = new MemoryStream();
         using var tw = new BinaryWriter(tokenMs, Encoding.Unicode, leaveOpen: true);
 
-        tw.Write((ushort)0);           // ParamOrdinal
+        tw.Write(ordinal);
         tw.Write((byte)paramName.Length);
         tw.Write(Encoding.Unicode.GetBytes(paramName));
         tw.Write((byte)0x01);          // Status: output param
         tw.Write((uint)0);             // UserType
         tw.Write((ushort)0);           // Flags
-        tw.Write(TdsConstants.TypeIntN);
-        tw.Write((byte)4);             // MaxLength
-        tw.Write((byte)4);             // ActualLength
-        tw.Write(value);
+
+        if (value is null || value is DBNull)
+        {
+            WriteReturnValueNull(tw, clrType);
+        }
+        else
+        {
+            WriteReturnValueTyped(tw, value);
+        }
 
         byte[] tokenData = tokenMs.ToArray();
         bw.Write((ushort)tokenData.Length);
         bw.Write(tokenData);
+    }
+
+    private static void WriteReturnValueNull(BinaryWriter tw, Type clrType)
+    {
+        if (clrType == typeof(int) || clrType == typeof(long) || clrType == typeof(short) || clrType == typeof(byte))
+        {
+            tw.Write(TdsConstants.TypeIntN);
+            tw.Write((byte)4);
+            tw.Write((byte)0); // NULL
+        }
+        else if (clrType == typeof(decimal))
+        {
+            tw.Write(TdsConstants.TypeNumericN);
+            tw.Write((byte)17);
+            tw.Write((byte)38);
+            tw.Write((byte)0);
+            tw.Write((byte)0); // NULL
+        }
+        else if (clrType == typeof(bool))
+        {
+            tw.Write(TdsConstants.TypeBitN);
+            tw.Write((byte)1);
+            tw.Write((byte)0); // NULL
+        }
+        else if (clrType == typeof(byte[]))
+        {
+            tw.Write(TdsConstants.TypeBigVarBin);
+            tw.Write((ushort)8000);
+            tw.Write(unchecked((ushort)0xFFFF)); // CHARBIN_NULL
+        }
+        else
+        {
+            tw.Write(TdsConstants.TypeNVarChar);
+            tw.Write((ushort)8000);
+            tw.Write(TdsConstants.DefaultCollation);
+            tw.Write(unchecked((ushort)0xFFFF)); // CHARBIN_NULL
+        }
+    }
+
+    private static void WriteReturnValueTyped(BinaryWriter tw, object value)
+    {
+        switch (value)
+        {
+            case int intVal:
+                tw.Write(TdsConstants.TypeIntN);
+                tw.Write((byte)4);
+                tw.Write((byte)4);
+                tw.Write(intVal);
+                break;
+
+            case long longVal:
+                tw.Write(TdsConstants.TypeIntN);
+                tw.Write((byte)8);
+                tw.Write((byte)8);
+                tw.Write(longVal);
+                break;
+
+            case short shortVal:
+                tw.Write(TdsConstants.TypeIntN);
+                tw.Write((byte)2);
+                tw.Write((byte)2);
+                tw.Write(shortVal);
+                break;
+
+            case byte byteVal:
+                tw.Write(TdsConstants.TypeIntN);
+                tw.Write((byte)1);
+                tw.Write((byte)1);
+                tw.Write(byteVal);
+                break;
+
+            case bool boolVal:
+                tw.Write(TdsConstants.TypeBitN);
+                tw.Write((byte)1);
+                tw.Write((byte)1);
+                tw.Write(boolVal ? (byte)1 : (byte)0);
+                break;
+
+            case decimal decVal:
+                WriteReturnValueDecimal(tw, decVal);
+                break;
+
+            case double dblVal:
+                tw.Write(TdsConstants.TypeFltN);
+                tw.Write((byte)8);
+                tw.Write((byte)8);
+                tw.Write(dblVal);
+                break;
+
+            case float fltVal:
+                tw.Write(TdsConstants.TypeFltN);
+                tw.Write((byte)4);
+                tw.Write((byte)4);
+                tw.Write(fltVal);
+                break;
+
+            case string strVal:
+                WriteReturnValueNVarChar(tw, strVal);
+                break;
+
+            case byte[] binVal:
+                WriteReturnValueBinary(tw, binVal);
+                break;
+
+            case Guid guidVal:
+                tw.Write(TdsConstants.TypeGuid);
+                tw.Write((byte)16);
+                tw.Write((byte)16);
+                tw.Write(guidVal.ToByteArray());
+                break;
+
+            default:
+                WriteReturnValueNVarChar(tw, value.ToString() ?? "");
+                break;
+        }
+    }
+
+    private static void WriteReturnValueDecimal(BinaryWriter tw, decimal value)
+    {
+        int[] bits = decimal.GetBits(value);
+        byte scale = (byte)((bits[3] >> 16) & 0xFF);
+        byte precision = 38;
+
+        tw.Write(TdsConstants.TypeNumericN);
+        tw.Write((byte)17);    // MaxLength
+        tw.Write(precision);
+        tw.Write(scale);
+
+        decimal abs = Math.Abs(value);
+        for (int i = 0; i < scale; i++)
+            abs *= 10m;
+
+        byte sign = value >= 0 ? (byte)1 : (byte)0;
+
+        ulong lo = (uint)decimal.GetBits(Math.Abs(value))[0] | ((ulong)(uint)decimal.GetBits(Math.Abs(value))[1] << 32);
+        ulong hi = (uint)decimal.GetBits(Math.Abs(value))[2];
+
+        int dataLen = precision switch
+        {
+            <= 9 => 4,
+            <= 19 => 8,
+            <= 28 => 12,
+            _ => 16,
+        };
+
+        tw.Write((byte)(dataLen + 1));
+        tw.Write(sign);
+
+        byte[] padded = new byte[dataLen];
+        BitConverter.TryWriteBytes(padded.AsSpan(0), lo);
+        if (dataLen > 8)
+            BitConverter.TryWriteBytes(padded.AsSpan(8), hi);
+        tw.Write(padded);
+    }
+
+    private static void WriteReturnValueNVarChar(BinaryWriter tw, string value)
+    {
+        byte[] bytes = Encoding.Unicode.GetBytes(value);
+        int maxLen = Math.Max(bytes.Length, 2);
+        if (maxLen > 8000) maxLen = 8000;
+
+        tw.Write(TdsConstants.TypeNVarChar);
+        tw.Write((ushort)maxLen);
+        tw.Write(TdsConstants.DefaultCollation);
+        tw.Write((ushort)bytes.Length);
+        tw.Write(bytes);
+    }
+
+    private static void WriteReturnValueBinary(BinaryWriter tw, byte[] value)
+    {
+        int maxLen = Math.Max(value.Length, 1);
+        if (maxLen > 8000) maxLen = 8000;
+
+        tw.Write(TdsConstants.TypeBigVarBin);
+        tw.Write((ushort)maxLen);
+        tw.Write((ushort)value.Length);
+        tw.Write(value);
     }
 
     #region RPC Payload Parsing

@@ -1,3 +1,4 @@
+using System.Data;
 using System.Text;
 using DbProxy.Tds;
 using Microsoft.Data.SqlClient;
@@ -20,6 +21,7 @@ public sealed class ResponseBuilder
 
     /// <summary>
     /// Executes a SQL command via RPC and builds the response with RETURNSTATUS + DONEINPROC/DONEPROC tokens.
+    /// Output parameters and return values from the SqlCommand are serialized as RETURNVALUE tokens.
     /// </summary>
     public async Task<byte[]> BuildRpcResponseAsync(
         SqlCommand cmd, int returnStatus, int? outputHandle = null, CancellationToken ct = default)
@@ -27,8 +29,14 @@ public sealed class ResponseBuilder
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
 
+        var infoMessages = new List<SqlInfoMessageEventArgs>();
+        SqlInfoMessageEventHandler infoHandler = (_, e) => infoMessages.Add(e);
+
         try
         {
+            if (cmd.Connection != null)
+                cmd.Connection.InfoMessage += infoHandler;
+
             using var reader = await cmd.ExecuteReaderAsync(ct);
             int resultSetIndex = 0;
 
@@ -76,7 +84,35 @@ public sealed class ResponseBuilder
 
             } while (true);
 
-            RpcHandler.WriteReturnStatus(bw, returnStatus);
+            reader.Close();
+
+            WriteInfoMessages(bw, infoMessages);
+
+            int actualReturnStatus = returnStatus;
+            ushort ordinal = 0;
+
+            foreach (SqlParameter p in cmd.Parameters)
+            {
+                if (p.Direction == ParameterDirection.ReturnValue)
+                {
+                    actualReturnStatus = p.Value is int rv ? rv : 0;
+                    continue;
+                }
+
+                if (p.Direction == ParameterDirection.Output
+                    || p.Direction == ParameterDirection.InputOutput)
+                {
+                    string name = p.ParameterName;
+                    object? val = p.Value;
+                    Type clrType = val is not null and not DBNull ? val.GetType() : MapSqlDbTypeToClrType(p.SqlDbType);
+
+                    _logger.LogDebug("RPC output param: {Name}={Value} (type={Type})", name, val, clrType.Name);
+                    RpcHandler.WriteReturnValue(bw, name, ordinal, val, clrType);
+                    ordinal++;
+                }
+            }
+
+            RpcHandler.WriteReturnStatus(bw, actualReturnStatus);
 
             if (outputHandle.HasValue)
                 RpcHandler.WriteReturnValueInt(bw, "@handle", outputHandle.Value);
@@ -99,6 +135,11 @@ public sealed class ResponseBuilder
                 ex.Message, "DbProxy", "", 0);
             RpcHandler.WriteDoneProcToken(bw, (ushort)(TdsConstants.DoneError | TdsConstants.DoneFinal), 0);
         }
+        finally
+        {
+            if (cmd.Connection != null)
+                cmd.Connection.InfoMessage -= infoHandler;
+        }
 
         var result = ms.ToArray();
 
@@ -112,6 +153,38 @@ public sealed class ResponseBuilder
         return result;
     }
 
+    private static Type MapSqlDbTypeToClrType(SqlDbType sqlDbType)
+    {
+        return sqlDbType switch
+        {
+            SqlDbType.Int => typeof(int),
+            SqlDbType.BigInt => typeof(long),
+            SqlDbType.SmallInt => typeof(short),
+            SqlDbType.TinyInt => typeof(byte),
+            SqlDbType.Bit => typeof(bool),
+            SqlDbType.Float => typeof(double),
+            SqlDbType.Real => typeof(float),
+            SqlDbType.Decimal or SqlDbType.Money or SqlDbType.SmallMoney => typeof(decimal),
+            SqlDbType.VarBinary or SqlDbType.Binary or SqlDbType.Image => typeof(byte[]),
+            SqlDbType.UniqueIdentifier => typeof(Guid),
+            _ => typeof(string),
+        };
+    }
+
+    private void WriteInfoMessages(BinaryWriter bw, List<SqlInfoMessageEventArgs> infoMessages)
+    {
+        foreach (var info in infoMessages)
+        {
+            foreach (SqlError err in info.Errors)
+            {
+                _logger.LogDebug("INFO message: Number={Number} Severity={Severity} State={State} Msg={Msg}",
+                    err.Number, err.Class, err.State, err.Message);
+                LoginHandler.WriteInfoToken(bw, err.Number, err.Class, err.State,
+                    err.Message, err.Server ?? "DbProxy", err.Procedure ?? "", err.LineNumber);
+            }
+        }
+    }
+
     /// <summary>
     /// Executes a SQL command against the backend and builds the complete TDS response bytes.
     /// Handles both result-returning queries (SELECT) and non-query statements (INSERT/UPDATE/DELETE/DDL).
@@ -121,8 +194,14 @@ public sealed class ResponseBuilder
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
 
+        var infoMessages = new List<SqlInfoMessageEventArgs>();
+        SqlInfoMessageEventHandler infoHandler = (_, e) => infoMessages.Add(e);
+
         try
         {
+            if (cmd.Connection != null)
+                cmd.Connection.InfoMessage += infoHandler;
+
             using var reader = await cmd.ExecuteReaderAsync(ct);
             int resultSetIndex = 0;
 
@@ -177,6 +256,8 @@ public sealed class ResponseBuilder
 
             } while (true);
 
+            WriteInfoMessages(bw, infoMessages);
+
             LoginHandler.WriteDoneToken(bw, TdsConstants.DoneFinal, 0);
             _logger.LogDebug("Final DONE token written (status=0x{Status:X4}). Total result sets: {Count}",
                 TdsConstants.DoneFinal, resultSetIndex);
@@ -194,6 +275,11 @@ public sealed class ResponseBuilder
             LoginHandler.WriteErrorToken(bw, 50000, 16, 1,
                 ex.Message, "DbProxy", "", 0);
             LoginHandler.WriteDoneToken(bw, (ushort)(TdsConstants.DoneError | TdsConstants.DoneFinal), 0);
+        }
+        finally
+        {
+            if (cmd.Connection != null)
+                cmd.Connection.InfoMessage -= infoHandler;
         }
 
         var result = ms.ToArray();
