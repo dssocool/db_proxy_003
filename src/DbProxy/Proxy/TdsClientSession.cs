@@ -28,6 +28,7 @@ public sealed class TdsClientSession : IAsyncDisposable
     private SqlConnection? _backendConnection;
     private string _database = "";
     private int _packetSize = TdsConstants.DefaultPacketSize;
+    private bool _marsEnabled;
 
     public TdsClientSession(TcpClient client, ProxyConfig config, ILoggerFactory loggerFactory)
     {
@@ -77,8 +78,11 @@ public sealed class TdsClientSession : IAsyncDisposable
             await OpenBackendConnectionAsync(ct);
             _logger.LogDebug("=== Backend connection opened ===");
 
-            _logger.LogDebug("=== Phase 4: Entering query loop ===");
-            await QueryLoopAsync(ct);
+            _logger.LogDebug("=== Phase 4: Entering query loop (MARS={Mars}) ===", _marsEnabled);
+            if (_marsEnabled)
+                await MarsQueryLoopAsync(ct);
+            else
+                await QueryLoopAsync(ct);
         }
         catch (OperationCanceledException)
         {
@@ -117,14 +121,18 @@ public sealed class TdsClientSession : IAsyncDisposable
             return false;
         }
 
-        var clientEncryption = _preLogin.ParseClientPreLogin(payload);
-        _logger.LogDebug("Client encryption preference: 0x{Enc:X2} ({EncName})", clientEncryption, EncryptionName(clientEncryption));
+        var preLoginResult = _preLogin.ParseClientPreLogin(payload);
+        _logger.LogDebug("Client encryption preference: 0x{Enc:X2} ({EncName}), MARS={Mars}",
+            preLoginResult.Encryption, EncryptionName(preLoginResult.Encryption), preLoginResult.MarsRequested);
+
+        _marsEnabled = preLoginResult.MarsRequested;
 
         byte[] response = _preLogin.BuildServerPreLoginResponse();
-        _logger.LogDebug("Sending server PRELOGIN response ({Len} bytes) with ENCRYPTION=NOT_SUP", response.Length);
+        _logger.LogDebug("Sending server PRELOGIN response ({Len} bytes) with ENCRYPTION=NOT_SUP MARS=on", response.Length);
         await _writer.WriteMessageAsync(TdsConstants.PacketTypeTabularResult, response, ct);
 
-        _logger.LogInformation("PRELOGIN handshake complete (client encryption=0x{Enc:X2}, server=NOT_SUP)", clientEncryption);
+        _logger.LogInformation("PRELOGIN handshake complete (client encryption=0x{Enc:X2}, server=NOT_SUP, MARS={Mars})",
+            preLoginResult.Encryption, _marsEnabled);
         return true;
     }
 
@@ -189,10 +197,22 @@ public sealed class TdsClientSession : IAsyncDisposable
     private async Task OpenBackendConnectionAsync(CancellationToken ct)
     {
         _logger.LogDebug("Opening backend SqlConnection...");
-        _backendConnection = new SqlConnection(_config.BackendConnectionString);
+
+        var connStr = _config.BackendConnectionString;
+        if (_marsEnabled)
+        {
+            var builder = new SqlConnectionStringBuilder(connStr)
+            {
+                MultipleActiveResultSets = true
+            };
+            connStr = builder.ConnectionString;
+            _logger.LogDebug("MARS enabled on backend connection string");
+        }
+
+        _backendConnection = new SqlConnection(connStr);
         await _backendConnection.OpenAsync(ct);
-        _logger.LogInformation("Backend connection opened: Server={Server} Database={Db} ServerVersion={Ver}",
-            _backendConnection.DataSource, _backendConnection.Database, _backendConnection.ServerVersion);
+        _logger.LogInformation("Backend connection opened: Server={Server} Database={Db} ServerVersion={Ver} MARS={Mars}",
+            _backendConnection.DataSource, _backendConnection.Database, _backendConnection.ServerVersion, _marsEnabled);
     }
 
     private async Task QueryLoopAsync(CancellationToken ct)
@@ -244,6 +264,343 @@ public sealed class TdsClientSession : IAsyncDisposable
             }
         }
     }
+
+    #region MARS (SMP) session multiplexing
+
+    private sealed class MarsSession
+    {
+        public ushort Sid { get; }
+        public uint RecvSeqNum { get; set; }
+        public uint SendSeqNum { get; set; }
+        public uint SendWindow { get; set; } = SmpConstants.DefaultWindow;
+        public uint RecvWindow { get; set; } = SmpConstants.DefaultWindow;
+        public MemoryStream Buffer { get; } = new();
+        public byte FirstPacketType { get; set; }
+        public bool Complete { get; set; }
+
+        public MarsSession(ushort sid) => Sid = sid;
+    }
+
+    private readonly Dictionary<ushort, MarsSession> _marsSessions = new();
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+    private async Task MarsQueryLoopAsync(CancellationToken ct)
+    {
+        var smpHeaderBuf = new byte[SmpConstants.HeaderSize];
+        int queryNum = 0;
+
+        while (!ct.IsCancellationRequested)
+        {
+            _logger.LogDebug("MARS: Waiting for SMP packet...");
+
+            int read = await ReadExactAsync(_stream, smpHeaderBuf, SmpConstants.HeaderSize, ct);
+            if (read == 0)
+            {
+                _logger.LogInformation("MARS: Client disconnected (EOF)");
+                break;
+            }
+
+            var smpHeader = SmpHeader.Read(smpHeaderBuf);
+            _logger.LogDebug("MARS: SMP packet Flags=0x{Flags:X2} SID={Sid} Len={Len} Seq={Seq} Wnd={Wnd}",
+                smpHeader.Flags, smpHeader.Sid, smpHeader.Length, smpHeader.SeqNum, smpHeader.Window);
+
+            if (smpHeader.SmId != SmpConstants.SmId)
+            {
+                _logger.LogWarning("MARS: Expected SMP header (SMID=0x53), got 0x{SmId:X2}. Falling back to non-MARS read.", smpHeader.SmId);
+                break;
+            }
+
+            int dataLen = smpHeader.DataLength;
+            byte[]? smpData = null;
+            if (dataLen > 0)
+            {
+                smpData = new byte[dataLen];
+                int dataRead = await ReadExactAsync(_stream, smpData, dataLen, ct);
+                if (dataRead == 0)
+                {
+                    _logger.LogInformation("MARS: Client disconnected while reading SMP data");
+                    break;
+                }
+            }
+
+            if (smpHeader.IsSyn)
+            {
+                _logger.LogDebug("MARS: SYN for SID={Sid}", smpHeader.Sid);
+                var session = new MarsSession(smpHeader.Sid)
+                {
+                    RecvWindow = smpHeader.Window,
+                };
+                _marsSessions[smpHeader.Sid] = session;
+
+                await WriteSmpControlAsync(SmpHeader.BuildSyn(smpHeader.Sid, SmpConstants.DefaultWindow), ct);
+                continue;
+            }
+
+            if (smpHeader.IsAck)
+            {
+                _logger.LogDebug("MARS: ACK for SID={Sid} Wnd={Wnd}", smpHeader.Sid, smpHeader.Window);
+                if (_marsSessions.TryGetValue(smpHeader.Sid, out var ackSession))
+                    ackSession.SendWindow = smpHeader.Window;
+                continue;
+            }
+
+            if (smpHeader.IsFin)
+            {
+                _logger.LogDebug("MARS: FIN for SID={Sid}", smpHeader.Sid);
+                _marsSessions.Remove(smpHeader.Sid);
+                continue;
+            }
+
+            if (!smpHeader.IsData || smpData is null)
+            {
+                _logger.LogWarning("MARS: Unexpected SMP flags 0x{Flags:X2}", smpHeader.Flags);
+                continue;
+            }
+
+            if (!_marsSessions.TryGetValue(smpHeader.Sid, out var marsSession))
+            {
+                _logger.LogWarning("MARS: DATA for unknown SID={Sid}, ignoring", smpHeader.Sid);
+                continue;
+            }
+
+            marsSession.RecvSeqNum = smpHeader.SeqNum;
+            marsSession.RecvWindow = smpHeader.Window;
+
+            var tdsHeader = TdsPacketHeader.Read(smpData);
+            int tdsPayloadLen = tdsHeader.Length - TdsConstants.PacketHeaderSize;
+
+            if (marsSession.Buffer.Length == 0)
+                marsSession.FirstPacketType = tdsHeader.Type;
+
+            if (tdsPayloadLen > 0 && tdsPayloadLen <= smpData.Length - TdsConstants.PacketHeaderSize)
+                marsSession.Buffer.Write(smpData, TdsConstants.PacketHeaderSize, tdsPayloadLen);
+
+            if (tdsHeader.IsEndOfMessage)
+            {
+                marsSession.Complete = true;
+
+                byte packetType = marsSession.FirstPacketType;
+                byte[] payload = marsSession.Buffer.ToArray();
+                marsSession.Buffer.SetLength(0);
+                marsSession.Complete = false;
+
+                queryNum++;
+                _logger.LogDebug("MARS: Complete TDS message on SID={Sid}: Type=0x{Type:X2} PayloadLen={Len}",
+                    smpHeader.Sid, packetType, payload.Length);
+
+                await SendSmpAckAsync(marsSession, ct);
+
+                await HandleMarsRequestAsync(marsSession, packetType, payload, queryNum, ct);
+            }
+        }
+    }
+
+    private async Task HandleMarsRequestAsync(MarsSession session, byte packetType, byte[] payload, int queryNum, CancellationToken ct)
+    {
+        switch (packetType)
+        {
+            case TdsConstants.PacketTypeSqlBatch:
+                _logger.LogDebug("MARS Query #{Num} SID={Sid}: SQL_BATCH ({Len} bytes)", queryNum, session.Sid, payload.Length);
+                await HandleMarsSqlBatchAsync(session, payload, ct);
+                break;
+
+            case TdsConstants.PacketTypeRpcRequest:
+                _logger.LogDebug("MARS Query #{Num} SID={Sid}: RPC_REQUEST ({Len} bytes)", queryNum, session.Sid, payload.Length);
+                await HandleMarsRpcRequestAsync(session, payload, ct);
+                break;
+
+            case TdsConstants.PacketTypeBulkLoad:
+                _logger.LogDebug("MARS Query #{Num} SID={Sid}: BULK_LOAD ({Len} bytes)", queryNum, session.Sid, payload.Length);
+                await HandleMarsBulkLoadAsync(session, payload, ct);
+                break;
+
+            case TdsConstants.PacketTypeAttention:
+                _logger.LogDebug("MARS Query #{Num} SID={Sid}: ATTENTION", queryNum, session.Sid);
+                await SendMarsDoneAsync(session, TdsConstants.DoneFinal, 0, ct);
+                break;
+
+            default:
+                _logger.LogWarning("MARS Query #{Num} SID={Sid}: Unsupported type 0x{Type:X2}", queryNum, session.Sid, packetType);
+                await SendMarsErrorAndDoneAsync(session, $"Unsupported TDS message type 0x{packetType:X2}", ct);
+                break;
+        }
+    }
+
+    private async Task HandleMarsSqlBatchAsync(MarsSession session, byte[] payload, CancellationToken ct)
+    {
+        string sql = _queryHandler.ParseSqlBatch(payload);
+        _logger.LogDebug("MARS SID={Sid}: Executing SQL: {Sql}", session.Sid, sql.Length > 500 ? sql[..500] + "..." : sql);
+
+        if (_backendConnection is null || _backendConnection.State != System.Data.ConnectionState.Open)
+        {
+            await SendMarsErrorAndDoneAsync(session, "Backend connection is not available", ct);
+            return;
+        }
+
+        if (_bulkLoadHandler.TryParseInsertBulk(sql))
+        {
+            await SendMarsDoneAsync(session, TdsConstants.DoneFinal, 0, ct);
+            return;
+        }
+
+        using var cmd = new SqlCommand(sql, _backendConnection);
+        cmd.CommandTimeout = 120;
+
+        byte[] response = await _responseBuilder.BuildResponseFromCommandAsync(cmd, ct);
+        await WriteSmpDataAsync(session, TdsConstants.PacketTypeTabularResult, response, ct);
+    }
+
+    private async Task HandleMarsRpcRequestAsync(MarsSession session, byte[] payload, CancellationToken ct)
+    {
+        if (_backendConnection is null || _backendConnection.State != System.Data.ConnectionState.Open)
+        {
+            await SendMarsErrorAndDoneAsync(session, "Backend connection is not available", ct);
+            return;
+        }
+
+        byte[] response = await _rpcHandler.HandleRpcAsync(payload, _backendConnection, ct);
+        await WriteSmpDataAsync(session, TdsConstants.PacketTypeTabularResult, response, ct);
+    }
+
+    private async Task HandleMarsBulkLoadAsync(MarsSession session, byte[] payload, CancellationToken ct)
+    {
+        if (_backendConnection is null || _backendConnection.State != System.Data.ConnectionState.Open)
+        {
+            await SendMarsErrorAndDoneAsync(session, "Backend connection is not available", ct);
+            return;
+        }
+
+        try
+        {
+            long rowCount = await _bulkLoadHandler.HandleBulkLoadAsync(payload, _backendConnection, ct);
+            await SendMarsDoneAsync(session, (ushort)(TdsConstants.DoneFinal | TdsConstants.DoneCount), rowCount, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "MARS BulkLoad error SID={Sid}: {Msg}", session.Sid, ex.Message);
+            await SendMarsErrorAndDoneAsync(session, ex.Message, ct);
+        }
+    }
+
+    private async Task SendMarsDoneAsync(MarsSession session, ushort status, long rowCount, CancellationToken ct)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        LoginHandler.WriteDoneToken(bw, status, rowCount);
+        await WriteSmpDataAsync(session, TdsConstants.PacketTypeTabularResult, ms.ToArray(), ct);
+    }
+
+    private async Task SendMarsErrorAndDoneAsync(MarsSession session, string message, CancellationToken ct)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        LoginHandler.WriteErrorToken(bw, 50000, 16, 1, message, "DbProxy", "", 0);
+        LoginHandler.WriteDoneToken(bw, (ushort)(TdsConstants.DoneError | TdsConstants.DoneFinal), 0);
+        await WriteSmpDataAsync(session, TdsConstants.PacketTypeTabularResult, ms.ToArray(), ct);
+    }
+
+    private async Task WriteSmpDataAsync(MarsSession session, byte packetType, ReadOnlyMemory<byte> payload, CancellationToken ct)
+    {
+        int maxPayloadPerPacket = _packetSize - TdsConstants.PacketHeaderSize;
+        int offset = 0;
+        int remaining = payload.Length;
+
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            if (remaining == 0)
+            {
+                await WriteSmpTdsPacketAsync(session, packetType, ReadOnlyMemory<byte>.Empty, true, ct);
+                return;
+            }
+
+            while (remaining > 0)
+            {
+                int chunk = Math.Min(remaining, maxPayloadPerPacket);
+                bool isLast = (remaining - chunk) == 0;
+                await WriteSmpTdsPacketAsync(session, packetType, payload.Slice(offset, chunk), isLast, ct);
+                offset += chunk;
+                remaining -= chunk;
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private async Task WriteSmpTdsPacketAsync(MarsSession session, byte packetType,
+        ReadOnlyMemory<byte> tdsPayload, bool isLast, CancellationToken ct)
+    {
+        ushort tdsLen = (ushort)(TdsConstants.PacketHeaderSize + tdsPayload.Length);
+        var tdsHeaderBytes = new byte[TdsConstants.PacketHeaderSize];
+        new TdsPacketHeader
+        {
+            Type = packetType,
+            Status = isLast ? TdsConstants.StatusEndOfMessage : TdsConstants.StatusNormal,
+            Length = tdsLen,
+            Spid = 0,
+            PacketId = 1,
+            Window = 0,
+        }.WriteTo(tdsHeaderBytes);
+
+        int smpDataLen = TdsConstants.PacketHeaderSize + tdsPayload.Length;
+        uint smpTotalLen = (uint)(SmpConstants.HeaderSize + smpDataLen);
+
+        session.SendSeqNum++;
+        var smpHeaderBytes = new byte[SmpConstants.HeaderSize];
+        new SmpHeader
+        {
+            SmId = SmpConstants.SmId,
+            Flags = SmpConstants.FlagData,
+            Sid = session.Sid,
+            Length = smpTotalLen,
+            SeqNum = session.SendSeqNum,
+            Window = session.RecvSeqNum + SmpConstants.DefaultWindow,
+        }.WriteTo(smpHeaderBytes);
+
+        await _stream.WriteAsync(smpHeaderBytes, ct);
+        await _stream.WriteAsync(tdsHeaderBytes, ct);
+        if (tdsPayload.Length > 0)
+            await _stream.WriteAsync(tdsPayload, ct);
+        await _stream.FlushAsync(ct);
+    }
+
+    private async Task WriteSmpControlAsync(byte[] smpPacket, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            await _stream.WriteAsync(smpPacket, ct);
+            await _stream.FlushAsync(ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private async Task SendSmpAckAsync(MarsSession session, CancellationToken ct)
+    {
+        var ack = SmpHeader.BuildAck(session.Sid, session.RecvSeqNum,
+            session.RecvSeqNum + SmpConstants.DefaultWindow);
+        await WriteSmpControlAsync(ack, ct);
+    }
+
+    private static async Task<int> ReadExactAsync(NetworkStream stream, byte[] buffer, int count, CancellationToken ct)
+    {
+        int offset = 0;
+        while (offset < count)
+        {
+            int n = await stream.ReadAsync(buffer.AsMemory(offset, count - offset), ct);
+            if (n == 0)
+                return 0;
+            offset += n;
+        }
+        return offset;
+    }
+
+    #endregion
 
     private async Task HandleRpcRequestAsync(byte[] payload, CancellationToken ct)
     {

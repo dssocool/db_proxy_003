@@ -13,13 +13,18 @@ public sealed class PreLoginHandler
         _logger = logger;
     }
 
-    /// <summary>
-    /// Parse the client's PRELOGIN payload to extract the requested encryption level.
-    /// Returns the encryption byte from the client, or EncryptNotSup if not found.
-    /// </summary>
-    public byte ParseClientPreLogin(ReadOnlySpan<byte> payload)
+    public sealed class PreLoginResult
     {
-        byte clientEncryption = TdsConstants.EncryptNotSup;
+        public byte Encryption { get; set; } = TdsConstants.EncryptNotSup;
+        public bool MarsRequested { get; set; }
+    }
+
+    /// <summary>
+    /// Parse the client's PRELOGIN payload to extract encryption and MARS preferences.
+    /// </summary>
+    public PreLoginResult ParseClientPreLogin(ReadOnlySpan<byte> payload)
+    {
+        var result = new PreLoginResult();
         int offset = 0;
 
         _logger.LogDebug("Parsing client PRELOGIN ({Len} bytes)", payload.Length);
@@ -74,28 +79,34 @@ public sealed class PreLoginHandler
 
             if (token == TdsConstants.PreLoginEncryption && dataLength >= 1 && dataOffset < payload.Length)
             {
-                clientEncryption = payload[dataOffset];
-                string encName = clientEncryption switch
+                result.Encryption = payload[dataOffset];
+                string encName = result.Encryption switch
                 {
                     TdsConstants.EncryptOff => "ENCRYPT_OFF",
                     TdsConstants.EncryptOn => "ENCRYPT_ON",
                     TdsConstants.EncryptNotSup => "ENCRYPT_NOT_SUP",
                     TdsConstants.EncryptRequired => "ENCRYPT_REQ",
-                    _ => $"UNKNOWN(0x{clientEncryption:X2})",
+                    _ => $"UNKNOWN(0x{result.Encryption:X2})",
                 };
-                _logger.LogDebug("    Client requested encryption: {EncName} (0x{Enc:X2})", encName, clientEncryption);
+                _logger.LogDebug("    Client requested encryption: {EncName} (0x{Enc:X2})", encName, result.Encryption);
 
-                if (clientEncryption == TdsConstants.EncryptOn || clientEncryption == TdsConstants.EncryptRequired)
+                if (result.Encryption == TdsConstants.EncryptOn || result.Encryption == TdsConstants.EncryptRequired)
                 {
                     _logger.LogWarning("    Client requires encryption (0x{Enc:X2}) but proxy does not support TLS. " +
-                        "The client (SSMS) may hang or fail after PRELOGIN if it expects a TLS handshake.", clientEncryption);
+                        "The client (SSMS) may hang or fail after PRELOGIN if it expects a TLS handshake.", result.Encryption);
                 }
+            }
+
+            if (token == TdsConstants.PreLoginMars && dataLength >= 1 && dataOffset < payload.Length)
+            {
+                result.MarsRequested = payload[dataOffset] != 0;
+                _logger.LogDebug("    Client MARS requested: {Mars}", result.MarsRequested);
             }
 
             offset += 5;
         }
 
-        return clientEncryption;
+        return result;
     }
 
     /// <summary>
@@ -147,11 +158,11 @@ public sealed class PreLoginHandler
         dataPos += 4;
 
         WriteOption(TdsConstants.PreLoginMars, marsLen);
-        buf[dataPos++] = 0x00;
+        buf[dataPos++] = 0x01;
 
         buf[headerPos] = TdsConstants.PreLoginTerminator;
 
-        _logger.LogDebug("Built server PRELOGIN response ({Len} bytes): VERSION=15.0 ENCRYPTION=NOT_SUP MARS=off", totalLen);
+        _logger.LogDebug("Built server PRELOGIN response ({Len} bytes): VERSION=15.0 ENCRYPTION=NOT_SUP MARS=on", totalLen);
         if (_logger.IsEnabled(LogLevel.Debug))
         {
             _logger.LogDebug("  PRELOGIN response hex: {Hex}", BitConverter.ToString(buf));
