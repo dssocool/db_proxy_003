@@ -51,3 +51,5 @@ Thumbs.db
 *.Publish.xml
 PublishScripts/
 publish/
+
+src/DbProxy/appsettings.json

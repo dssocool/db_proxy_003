@@ -1,0 +1,1 @@
+sqlcmd -S localhost,11433 -U proxyuser -P 'proxypassword' -Q "USE MyNewDatabase; SELECT * from Users"
