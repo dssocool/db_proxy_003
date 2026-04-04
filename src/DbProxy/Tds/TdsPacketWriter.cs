@@ -85,6 +85,7 @@ public sealed class TdsPacketWriter
         TdsConstants.PacketTypeRpcRequest => "RPC_REQUEST",
         TdsConstants.PacketTypeTabularResult => "TABULAR_RESULT",
         TdsConstants.PacketTypeAttention => "ATTENTION",
+        TdsConstants.PacketTypeBulkLoad => "BULK_LOAD",
         TdsConstants.PacketTypeLogin7 => "LOGIN7",
         TdsConstants.PacketTypePreLogin => "PRELOGIN",
         _ => $"UNKNOWN(0x{type:X2})",

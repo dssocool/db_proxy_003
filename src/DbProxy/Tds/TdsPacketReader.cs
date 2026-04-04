@@ -107,6 +107,7 @@ public sealed class TdsPacketReader
         TdsConstants.PacketTypeRpcRequest => "RPC_REQUEST",
         TdsConstants.PacketTypeTabularResult => "TABULAR_RESULT",
         TdsConstants.PacketTypeAttention => "ATTENTION",
+        TdsConstants.PacketTypeBulkLoad => "BULK_LOAD",
         TdsConstants.PacketTypeLogin7 => "LOGIN7",
         TdsConstants.PacketTypePreLogin => "PRELOGIN",
         0x11 => "SSPI",

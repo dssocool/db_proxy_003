@@ -24,6 +24,7 @@ public sealed class TdsClientSession : IAsyncDisposable
     private readonly QueryHandler _queryHandler;
     private readonly ResponseBuilder _responseBuilder;
     private readonly RpcHandler _rpcHandler;
+    private readonly BulkLoadHandler _bulkLoadHandler;
     private SqlConnection? _backendConnection;
     private string _database = "";
     private int _packetSize = TdsConstants.DefaultPacketSize;
@@ -44,6 +45,7 @@ public sealed class TdsClientSession : IAsyncDisposable
         _queryHandler = new QueryHandler(loggerFactory.CreateLogger<QueryHandler>());
         _responseBuilder = new ResponseBuilder(loggerFactory.CreateLogger<ResponseBuilder>());
         _rpcHandler = new RpcHandler(loggerFactory.CreateLogger<RpcHandler>(), _responseBuilder);
+        _bulkLoadHandler = new BulkLoadHandler(loggerFactory.CreateLogger<BulkLoadHandler>());
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -223,6 +225,12 @@ public sealed class TdsClientSession : IAsyncDisposable
                     _logger.LogDebug("Query #{Num}: RPC response sent", queryNum);
                     break;
 
+                case TdsConstants.PacketTypeBulkLoad:
+                    _logger.LogDebug("Query #{Num}: BULK_LOAD ({Len} bytes payload)", queryNum, payload.Length);
+                    await HandleBulkLoadAsync(payload, ct);
+                    _logger.LogDebug("Query #{Num}: BulkLoad response sent", queryNum);
+                    break;
+
                 case TdsConstants.PacketTypeAttention:
                     _logger.LogDebug("Query #{Num}: Received ATTENTION signal, sending empty DONE", queryNum);
                     await SendDoneAsync(TdsConstants.DoneFinal, 0, ct);
@@ -265,6 +273,13 @@ public sealed class TdsClientSession : IAsyncDisposable
             return;
         }
 
+        if (_bulkLoadHandler.TryParseInsertBulk(sql))
+        {
+            _logger.LogDebug("INSERT BULK intercepted, sending DONE to client (awaiting 0x07 data)");
+            await SendDoneAsync(TdsConstants.DoneFinal, 0, ct);
+            return;
+        }
+
         using var cmd = new SqlCommand(sql, _backendConnection);
         cmd.CommandTimeout = 120;
 
@@ -273,6 +288,28 @@ public sealed class TdsClientSession : IAsyncDisposable
         await _writer.WriteMessageAsync(TdsConstants.PacketTypeTabularResult, response, ct);
         _logger.LogDebug("Response flushed to client. Socket connected={Connected} DataAvailable={DataAvailable}",
             _client.Connected, _stream.DataAvailable);
+    }
+
+    private async Task HandleBulkLoadAsync(byte[] payload, CancellationToken ct)
+    {
+        if (_backendConnection is null || _backendConnection.State != System.Data.ConnectionState.Open)
+        {
+            _logger.LogWarning("Backend connection not available for BulkLoad (State={State})",
+                _backendConnection?.State.ToString() ?? "null");
+            await SendErrorAndDoneAsync("Backend connection is not available", ct);
+            return;
+        }
+
+        try
+        {
+            long rowCount = await _bulkLoadHandler.HandleBulkLoadAsync(payload, _backendConnection, ct);
+            await SendDoneAsync((ushort)(TdsConstants.DoneFinal | TdsConstants.DoneCount), rowCount, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "BulkLoad error: {Msg}", ex.Message);
+            await SendErrorAndDoneAsync(ex.Message, ct);
+        }
     }
 
     private async Task SendDoneAsync(ushort status, long rowCount, CancellationToken ct)

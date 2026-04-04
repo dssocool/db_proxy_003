@@ -16,6 +16,7 @@ public static class TdsConstants
     public const byte PacketTypeRpcRequest = 0x03;
     public const byte PacketTypeTabularResult = 0x04;
     public const byte PacketTypeAttention = 0x06;
+    public const byte PacketTypeBulkLoad = 0x07;
     public const byte PacketTypeLogin7 = 0x10;
     public const byte PacketTypePreLogin = 0x12;
 
