@@ -94,6 +94,10 @@ public static class TdsConstants
     public const byte TypeNText = 0x63;
     public const byte TypeText = 0x23;
     public const byte TypeImage = 0x22;
+    public const byte TypeTable = 0xF3;
+
+    public const byte TvpRowToken = 0x01;
+    public const byte TvpEndToken = 0x00;
 
     // Collation for NVARCHAR (raw_collation for Windows Latin1)
     public static readonly byte[] DefaultCollation = [0x09, 0x04, 0xD0, 0x00, 0x34];

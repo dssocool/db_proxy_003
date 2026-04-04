@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Data;
+using System.Data.Common;
 using System.Text;
 using DbProxy.Tds;
 using Microsoft.Data.SqlClient;
@@ -171,6 +172,12 @@ public sealed class RpcHandler
                 Value = p.Value ?? (object)DBNull.Value,
                 Direction = p.IsOutput ? ParameterDirection.InputOutput : ParameterDirection.Input,
             };
+            if (p.IsTvp)
+            {
+                sqlParam.SqlDbType = SqlDbType.Structured;
+                sqlParam.TypeName = p.TvpTypeName;
+                sqlParam.Direction = ParameterDirection.Input;
+            }
             cmd.Parameters.Add(sqlParam);
         }
 
@@ -550,7 +557,6 @@ public sealed class RpcHandler
 
     private (RpcParameter param, int newOffset) ReadParameter(ReadOnlySpan<byte> payload, int offset)
     {
-        // B_VARCHAR: param name length (byte, in chars), then UTF-16LE name
         byte nameCharLen = payload[offset++];
         string name = "";
         if (nameCharLen > 0)
@@ -564,9 +570,15 @@ public sealed class RpcHandler
         bool isOutput = (statusFlags & 0x01) != 0;
         bool isDefault = (statusFlags & 0x02) != 0;
 
-        // Read TYPE_INFO and value
-        var (value, stringValue, intValue, newOffset) = ReadTypeInfoAndValue(payload, offset);
+        byte typeId = payload[offset];
+        if (typeId == TdsConstants.TypeTable)
+        {
+            var (tvpValue, tvpTypeName, newOff) = ReadTvpParam(payload, offset + 1);
+            return (new RpcParameter(name, isOutput, isDefault, tvpValue, null, null,
+                IsTvp: true, TvpTypeName: tvpTypeName), newOff);
+        }
 
+        var (value, stringValue, intValue, newOffset) = ReadTypeInfoAndValue(payload, offset);
         return (new RpcParameter(name, isOutput, isDefault, value, stringValue, intValue), newOffset);
     }
 
@@ -875,6 +887,394 @@ public sealed class RpcHandler
         return (val, null, null, offset);
     }
 
+    private (DataTable? value, string? tvpTypeName, int newOffset) ReadTvpParam(
+        ReadOnlySpan<byte> payload, int offset)
+    {
+        string dbName = ReadBVarCharUtf16(payload, ref offset);
+        string schemaName = ReadBVarCharUtf16(payload, ref offset);
+        string typeName = ReadBVarCharUtf16(payload, ref offset);
+
+        string fullTypeName = string.IsNullOrEmpty(schemaName)
+            ? typeName
+            : $"{schemaName}.{typeName}";
+        if (!string.IsNullOrEmpty(dbName))
+            fullTypeName = $"{dbName}.{fullTypeName}";
+
+        ushort colCount = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+        offset += 2;
+
+        if (colCount == 0)
+        {
+            _logger.LogDebug("TVP param: null TVP (colCount=0), type={TypeName}", fullTypeName);
+            return (null, fullTypeName, offset);
+        }
+
+        var colMetas = new TvpColumnMeta[colCount];
+        for (int c = 0; c < colCount; c++)
+        {
+            uint userType = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+            offset += 4;
+            ushort flags = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+            offset += 2;
+
+            byte colTypeId = payload[offset++];
+            byte maxLen = 0;
+            ushort maxLen16 = 0;
+            byte precision = 0;
+            byte scale = 0;
+            byte[]? collation = null;
+
+            switch (colTypeId)
+            {
+                case TdsConstants.TypeIntN:
+                case TdsConstants.TypeBitN:
+                case TdsConstants.TypeFltN:
+                case TdsConstants.TypeMoneyN:
+                case TdsConstants.TypeDateTimeN:
+                case TdsConstants.TypeGuid:
+                    maxLen = payload[offset++];
+                    break;
+
+                case TdsConstants.TypeNumericN:
+                    maxLen = payload[offset++];
+                    precision = payload[offset++];
+                    scale = payload[offset++];
+                    break;
+
+                case TdsConstants.TypeNVarChar:
+                    maxLen16 = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+                    offset += 2;
+                    collation = payload.Slice(offset, 5).ToArray();
+                    offset += 5;
+                    break;
+
+                case TdsConstants.TypeBigVarChar:
+                    maxLen16 = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+                    offset += 2;
+                    collation = payload.Slice(offset, 5).ToArray();
+                    offset += 5;
+                    break;
+
+                case TdsConstants.TypeBigVarBin:
+                case TdsConstants.TypeBigBinary:
+                    maxLen16 = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+                    offset += 2;
+                    break;
+
+                case TdsConstants.TypeDateN:
+                    break;
+
+                case TdsConstants.TypeTimeN:
+                case TdsConstants.TypeDateTime2N:
+                case TdsConstants.TypeDateTimeOffsetN:
+                    scale = payload[offset++];
+                    break;
+
+                default:
+                    _logger.LogWarning("TVP column type 0x{Type:X2} not specifically handled, attempting fixed-len", colTypeId);
+                    maxLen = payload[offset++];
+                    break;
+            }
+
+            colMetas[c] = new TvpColumnMeta(colTypeId, maxLen, maxLen16, precision, scale, collation);
+        }
+
+        SkipTvpConstraints(payload, ref offset, colCount);
+
+        var dt = BuildDataTableFromMeta(colMetas);
+
+        while (offset < payload.Length && payload[offset] == TdsConstants.TvpRowToken)
+        {
+            offset++;
+            var row = new object[colCount];
+
+            for (int c = 0; c < colCount; c++)
+            {
+                var meta = colMetas[c];
+                row[c] = ReadTvpColumnValue(payload, ref offset, meta);
+            }
+
+            dt.Rows.Add(row);
+        }
+
+        if (offset < payload.Length && payload[offset] == TdsConstants.TvpEndToken)
+            offset++;
+
+        _logger.LogDebug("TVP param: type={TypeName}, cols={Cols}, rows={Rows}",
+            fullTypeName, colCount, dt.Rows.Count);
+
+        return (dt, fullTypeName, offset);
+    }
+
+    private static string ReadBVarCharUtf16(ReadOnlySpan<byte> payload, ref int offset)
+    {
+        byte charLen = payload[offset++];
+        if (charLen == 0)
+            return "";
+        int byteLen = charLen * 2;
+        string val = Encoding.Unicode.GetString(payload.Slice(offset, byteLen));
+        offset += byteLen;
+        return val;
+    }
+
+    private static void SkipTvpConstraints(ReadOnlySpan<byte> payload, ref int offset, int colCount)
+    {
+        while (offset < payload.Length)
+        {
+            byte token = payload[offset];
+            if (token == TdsConstants.TvpRowToken || token == TdsConstants.TvpEndToken)
+                break;
+
+            if (token == 0x10) // TVP_ORDER_UNIQUE
+            {
+                offset++;
+                ushort numCols = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+                offset += 2;
+                for (int i = 0; i < numCols; i++)
+                {
+                    offset += 2; // ColNum (USHORT)
+                    offset += 1; // Flags (BYTE)
+                }
+            }
+            else if (token == 0x11) // TVP_COLUMN_FLAGS
+            {
+                offset++;
+                int flagBytes = (colCount + 7) / 8;
+                offset += flagBytes;
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+
+    private static DataTable BuildDataTableFromMeta(TvpColumnMeta[] metas)
+    {
+        var dt = new DataTable();
+        for (int c = 0; c < metas.Length; c++)
+        {
+            Type clrType = metas[c].TypeId switch
+            {
+                TdsConstants.TypeIntN => metas[c].MaxLen switch
+                {
+                    1 => typeof(byte),
+                    2 => typeof(short),
+                    8 => typeof(long),
+                    _ => typeof(int),
+                },
+                TdsConstants.TypeBitN => typeof(bool),
+                TdsConstants.TypeFltN => metas[c].MaxLen <= 4 ? typeof(float) : typeof(double),
+                TdsConstants.TypeNumericN => typeof(decimal),
+                TdsConstants.TypeNVarChar => typeof(string),
+                TdsConstants.TypeBigVarChar => typeof(string),
+                TdsConstants.TypeBigVarBin or TdsConstants.TypeBigBinary => typeof(byte[]),
+                TdsConstants.TypeGuid => typeof(Guid),
+                TdsConstants.TypeDateN or TdsConstants.TypeDateTimeN => typeof(DateTime),
+                TdsConstants.TypeTimeN => typeof(TimeSpan),
+                TdsConstants.TypeDateTime2N => typeof(DateTime),
+                TdsConstants.TypeDateTimeOffsetN => typeof(DateTimeOffset),
+                TdsConstants.TypeMoneyN => typeof(decimal),
+                _ => typeof(object),
+            };
+
+            dt.Columns.Add($"Col{c}", clrType);
+        }
+        return dt;
+    }
+
+    private static object ReadTvpColumnValue(ReadOnlySpan<byte> payload, ref int offset, TvpColumnMeta meta)
+    {
+        switch (meta.TypeId)
+        {
+            case TdsConstants.TypeIntN:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                object val = len switch
+                {
+                    1 => (object)payload[offset],
+                    2 => (object)BinaryPrimitives.ReadInt16LittleEndian(payload[offset..]),
+                    4 => (object)BinaryPrimitives.ReadInt32LittleEndian(payload[offset..]),
+                    8 => (object)BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]),
+                    _ => (object)BinaryPrimitives.ReadInt32LittleEndian(payload[offset..]),
+                };
+                offset += len;
+                return val;
+            }
+
+            case TdsConstants.TypeBitN:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                bool val = payload[offset++] != 0;
+                return val;
+            }
+
+            case TdsConstants.TypeFltN:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                if (len == 4)
+                {
+                    float f = BitConverter.ToSingle(payload.Slice(offset, 4));
+                    offset += 4;
+                    return f;
+                }
+                double d = BitConverter.ToDouble(payload.Slice(offset, 8));
+                offset += 8;
+                return d;
+            }
+
+            case TdsConstants.TypeMoneyN:
+            case TdsConstants.TypeDateTimeN:
+            case TdsConstants.TypeGuid:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                byte[] data = payload.Slice(offset, len).ToArray();
+                offset += len;
+                if (meta.TypeId == TdsConstants.TypeGuid && len == 16)
+                    return new Guid(data);
+                return data;
+            }
+
+            case TdsConstants.TypeNumericN:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                byte sign = payload[offset];
+                byte[] intBytes = payload.Slice(offset + 1, len - 1).ToArray();
+                offset += len;
+
+                ulong lo = 0, hi = 0;
+                for (int i = Math.Min(intBytes.Length, 8) - 1; i >= 0; i--)
+                    lo = (lo << 8) | intBytes[i];
+                for (int i = Math.Min(intBytes.Length, 16) - 1; i >= 8; i--)
+                    hi = (hi << 8) | intBytes[i];
+
+                decimal result = (decimal)lo;
+                if (hi != 0)
+                    result += (decimal)hi * (1UL << 32) * (1UL << 32);
+                for (int i = 0; i < meta.Scale; i++)
+                    result /= 10m;
+                if (sign == 0)
+                    result = -result;
+                return result;
+            }
+
+            case TdsConstants.TypeNVarChar:
+            {
+                if (meta.MaxLen16 == 0xFFFF)
+                {
+                    return ReadTvpPlpString(payload, ref offset, Encoding.Unicode);
+                }
+                ushort len = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+                offset += 2;
+                if (len == 0xFFFF) return DBNull.Value;
+                string s = Encoding.Unicode.GetString(payload.Slice(offset, len));
+                offset += len;
+                return s;
+            }
+
+            case TdsConstants.TypeBigVarChar:
+            {
+                if (meta.MaxLen16 == 0xFFFF)
+                {
+                    return ReadTvpPlpString(payload, ref offset, Encoding.UTF8);
+                }
+                ushort len = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+                offset += 2;
+                if (len == 0xFFFF) return DBNull.Value;
+                string s = Encoding.UTF8.GetString(payload.Slice(offset, len));
+                offset += len;
+                return s;
+            }
+
+            case TdsConstants.TypeBigVarBin:
+            case TdsConstants.TypeBigBinary:
+            {
+                if (meta.MaxLen16 == 0xFFFF)
+                {
+                    return ReadTvpPlpBinary(payload, ref offset);
+                }
+                ushort len = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+                offset += 2;
+                if (len == 0xFFFF) return DBNull.Value;
+                byte[] data = payload.Slice(offset, len).ToArray();
+                offset += len;
+                return data;
+            }
+
+            case TdsConstants.TypeDateN:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                byte[] data = payload.Slice(offset, len).ToArray();
+                offset += len;
+                return data;
+            }
+
+            case TdsConstants.TypeTimeN:
+            case TdsConstants.TypeDateTime2N:
+            case TdsConstants.TypeDateTimeOffsetN:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                byte[] data = payload.Slice(offset, len).ToArray();
+                offset += len;
+                return data;
+            }
+
+            default:
+            {
+                byte len = payload[offset++];
+                if (len == 0) return DBNull.Value;
+                byte[] data = payload.Slice(offset, len).ToArray();
+                offset += len;
+                return data;
+            }
+        }
+    }
+
+    private static object ReadTvpPlpString(ReadOnlySpan<byte> payload, ref int offset, Encoding encoding)
+    {
+        ulong totalLen = BinaryPrimitives.ReadUInt64LittleEndian(payload[offset..]);
+        offset += 8;
+        if (totalLen == 0xFFFFFFFFFFFFFFFF)
+            return DBNull.Value;
+
+        var sb = new StringBuilder();
+        while (offset < payload.Length)
+        {
+            uint chunkLen = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+            offset += 4;
+            if (chunkLen == 0) break;
+            sb.Append(encoding.GetString(payload.Slice(offset, (int)chunkLen)));
+            offset += (int)chunkLen;
+        }
+        return sb.ToString();
+    }
+
+    private static object ReadTvpPlpBinary(ReadOnlySpan<byte> payload, ref int offset)
+    {
+        ulong totalLen = BinaryPrimitives.ReadUInt64LittleEndian(payload[offset..]);
+        offset += 8;
+        if (totalLen == 0xFFFFFFFFFFFFFFFF)
+            return DBNull.Value;
+
+        using var ms = new MemoryStream();
+        while (offset < payload.Length)
+        {
+            uint chunkLen = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+            offset += 4;
+            if (chunkLen == 0) break;
+            ms.Write(payload.Slice(offset, (int)chunkLen));
+            offset += (int)chunkLen;
+        }
+        return ms.ToArray();
+    }
+
     private static (object? value, string? stringValue, int? intValue, int newOffset) ReadDateParam(
         ReadOnlySpan<byte> payload, int offset)
     {
@@ -914,6 +1314,16 @@ public sealed record RpcParameter(
     bool IsDefault,
     object? Value,
     string? StringValue,
-    int? IntValue);
+    int? IntValue,
+    bool IsTvp = false,
+    string? TvpTypeName = null);
 
 public sealed record PreparedStatement(string Sql, string? ParamDefinitions);
+
+internal sealed record TvpColumnMeta(
+    byte TypeId,
+    byte MaxLen,
+    ushort MaxLen16,
+    byte Precision,
+    byte Scale,
+    byte[]? Collation);
