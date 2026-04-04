@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
 
 namespace SqlProxyTests;
 
@@ -15,19 +16,54 @@ public static class TestSetup
     public const string BulkCopyTableName = "BulkCopyTarget";
     public const string AdapterTableName = "AdapterTestTable";
 
-    public const string DirectConnBase =
-        "Server=127.0.0.1,1433;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=true;Encrypt=true;";
-    public const string ProxyConnBase =
-        "Server=127.0.0.1,21433;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=true;Encrypt=false;";
+    static TestSetup()
+    {
+        var config = new ConfigurationBuilder()
+            .SetBasePath(AppContext.BaseDirectory)
+            .AddJsonFile("appsettings.json", optional: false)
+            .Build();
 
-    public static string DirectConn => DirectConnBase + $"Database={TestDbName};";
-    public static string ProxyConn => ProxyConnBase + $"Database={TestDbName};";
+        var proxySection = config.GetSection("Proxy");
+        int listenPort = int.Parse(proxySection["ListenPort"] ?? "1433");
+        string sqlUsername = proxySection["SqlUsername"] ?? "proxyuser";
+        string sqlPassword = proxySection["SqlPassword"] ?? "proxypassword";
+        string backendConnStr = proxySection["BackendConnectionString"]
+            ?? throw new InvalidOperationException("BackendConnectionString not found in appsettings.json");
+
+        var backend = new SqlConnectionStringBuilder(backendConnStr);
+        DirectConnBase = new SqlConnectionStringBuilder
+        {
+            DataSource = backend.DataSource,
+            UserID = backend.UserID,
+            Password = backend.Password,
+            TrustServerCertificate = true,
+            Encrypt = backend.Encrypt,
+        }.ConnectionString;
+
+        ProxyConnBase = new SqlConnectionStringBuilder
+        {
+            DataSource = $"127.0.0.1,{listenPort}",
+            UserID = sqlUsername,
+            Password = sqlPassword,
+            TrustServerCertificate = true,
+            Encrypt = false,
+        }.ConnectionString;
+    }
+
+    public static readonly string DirectConnBase;
+    public static readonly string ProxyConnBase;
+
+    public static string DirectConn => new SqlConnectionStringBuilder(DirectConnBase)
+        { InitialCatalog = TestDbName }.ConnectionString;
+    public static string ProxyConn => new SqlConnectionStringBuilder(ProxyConnBase)
+        { InitialCatalog = TestDbName }.ConnectionString;
 
     public static void SetupDatabase()
     {
         Console.WriteLine($"Setting up test database [{TestDbName}]...");
 
-        using (var conn = new SqlConnection(DirectConnBase + "Database=master;"))
+        using (var conn = new SqlConnection(
+            new SqlConnectionStringBuilder(DirectConnBase) { InitialCatalog = "master" }.ConnectionString))
         {
             conn.Open();
             ExecNonQuery(conn, $@"
@@ -36,7 +72,8 @@ public static class TestSetup
         }
         Console.WriteLine("  Database created (or already exists).");
 
-        using (var conn = new SqlConnection(DirectConnBase + $"Database={TestDbName};"))
+        using (var conn = new SqlConnection(
+            new SqlConnectionStringBuilder(DirectConnBase) { InitialCatalog = TestDbName }.ConnectionString))
         {
             conn.Open();
 
@@ -437,7 +474,8 @@ public static class TestSetup
     public static void TeardownDatabase()
     {
         Console.WriteLine($"Tearing down test database [{TestDbName}]...");
-        using var conn = new SqlConnection(DirectConnBase + "Database=master;");
+        using var conn = new SqlConnection(
+            new SqlConnectionStringBuilder(DirectConnBase) { InitialCatalog = "master" }.ConnectionString);
         conn.Open();
         ExecNonQuery(conn, $@"
             IF DB_ID('{TestDbName}') IS NOT NULL
