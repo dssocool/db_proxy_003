@@ -19,6 +19,100 @@ public sealed class ResponseBuilder
     }
 
     /// <summary>
+    /// Executes a SQL command via RPC and builds the response with RETURNSTATUS + DONEINPROC/DONEPROC tokens.
+    /// </summary>
+    public async Task<byte[]> BuildRpcResponseAsync(
+        SqlCommand cmd, int returnStatus, int? outputHandle = null, CancellationToken ct = default)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms, Encoding.Unicode, leaveOpen: true);
+
+        try
+        {
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            int resultSetIndex = 0;
+
+            do
+            {
+                resultSetIndex++;
+                bool hasMoreResults = false;
+
+                if (reader.FieldCount > 0)
+                {
+                    var colInfos = BuildColumnInfos(reader);
+                    _logger.LogDebug("RPC ResultSet #{Idx}: {ColCount} columns", resultSetIndex, colInfos.Length);
+
+                    WriteColMetadata(bw, colInfos);
+
+                    long rowCount = 0;
+                    while (await reader.ReadAsync(ct))
+                    {
+                        WriteRow(bw, reader, colInfos);
+                        rowCount++;
+                    }
+                    _logger.LogDebug("RPC ResultSet #{Idx}: {RowCount} rows written", resultSetIndex, rowCount);
+
+                    hasMoreResults = await reader.NextResultAsync(ct);
+
+                    ushort doneStatus = (ushort)(TdsConstants.DoneCount
+                        | (hasMoreResults ? TdsConstants.DoneMore : 0));
+                    RpcHandler.WriteDoneInProcToken(bw, doneStatus, rowCount);
+                }
+                else
+                {
+                    int affected = reader.RecordsAffected;
+                    _logger.LogDebug("RPC ResultSet #{Idx}: non-query, RecordsAffected={Affected}", resultSetIndex, affected);
+
+                    hasMoreResults = await reader.NextResultAsync(ct);
+
+                    ushort status = (ushort)(
+                        (hasMoreResults ? TdsConstants.DoneMore : 0)
+                        | (affected >= 0 ? TdsConstants.DoneCount : 0));
+                    RpcHandler.WriteDoneInProcToken(bw, status, affected >= 0 ? affected : 0);
+                }
+
+                if (!hasMoreResults)
+                    break;
+
+            } while (true);
+
+            RpcHandler.WriteReturnStatus(bw, returnStatus);
+
+            if (outputHandle.HasValue)
+                RpcHandler.WriteReturnValueInt(bw, "@handle", outputHandle.Value);
+
+            RpcHandler.WriteDoneProcToken(bw, TdsConstants.DoneFinal, 0);
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogError(ex, "Backend SQL error in RPC: {Msg}", ex.Message);
+            RpcHandler.WriteReturnStatus(bw, 1);
+            LoginHandler.WriteErrorToken(bw, ex.Number, ex.Class, ex.State,
+                ex.Message, "DbProxy", ex.Procedure ?? "", ex.LineNumber);
+            RpcHandler.WriteDoneProcToken(bw, (ushort)(TdsConstants.DoneError | TdsConstants.DoneFinal), 0);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error executing RPC");
+            RpcHandler.WriteReturnStatus(bw, 1);
+            LoginHandler.WriteErrorToken(bw, 50000, 16, 1,
+                ex.Message, "DbProxy", "", 0);
+            RpcHandler.WriteDoneProcToken(bw, (ushort)(TdsConstants.DoneError | TdsConstants.DoneFinal), 0);
+        }
+
+        var result = ms.ToArray();
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug("=== RPC response token stream ({Len} bytes) ===", result.Length);
+            DumpTokenStream(result);
+            _logger.LogDebug("=== End RPC token stream dump ===");
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Executes a SQL command against the backend and builds the complete TDS response bytes.
     /// Handles both result-returning queries (SELECT) and non-query statements (INSERT/UPDATE/DELETE/DDL).
     /// </summary>
@@ -132,10 +226,23 @@ public sealed class ResponseBuilder
                 TdsConstants.TokenLoginAck => "LOGINACK",
                 TdsConstants.TokenEnvChange => "ENVCHANGE",
                 TdsConstants.TokenOrder => "ORDER",
+                TdsConstants.TokenReturnStatus => "RETURNSTATUS",
+                TdsConstants.TokenReturnValue => "RETURNVALUE",
                 _ => $"UNKNOWN(0x{token:X2})",
             };
 
-            if (token == TdsConstants.TokenDone || token == TdsConstants.TokenDoneProc || token == TdsConstants.TokenDoneInProc)
+            if (token == TdsConstants.TokenReturnStatus)
+            {
+                if (offset + 5 <= data.Length)
+                {
+                    int retVal = BitConverter.ToInt32(data, offset + 1);
+                    _logger.LogDebug("  @{Offset}: {Token} value={Value}", offset, tokenName, retVal);
+                    offset += 5;
+                }
+                else
+                    break;
+            }
+            else if (token == TdsConstants.TokenDone || token == TdsConstants.TokenDoneProc || token == TdsConstants.TokenDoneInProc)
             {
                 if (offset + 13 <= data.Length)
                 {
@@ -174,7 +281,7 @@ public sealed class ResponseBuilder
             }
             else if (token == TdsConstants.TokenError || token == TdsConstants.TokenInfo
                      || token == TdsConstants.TokenLoginAck || token == TdsConstants.TokenEnvChange
-                     || token == TdsConstants.TokenOrder)
+                     || token == TdsConstants.TokenOrder || token == TdsConstants.TokenReturnValue)
             {
                 if (offset + 3 <= data.Length)
                 {
@@ -202,6 +309,7 @@ public sealed class ResponseBuilder
             TdsConstants.TokenDone, TdsConstants.TokenDoneProc, TdsConstants.TokenDoneInProc,
             TdsConstants.TokenError, TdsConstants.TokenInfo,
             TdsConstants.TokenLoginAck, TdsConstants.TokenEnvChange, TdsConstants.TokenOrder,
+            TdsConstants.TokenReturnStatus, TdsConstants.TokenReturnValue,
         ];
 
         for (int i = start; i < data.Length; i++)
@@ -211,6 +319,11 @@ public sealed class ResponseBuilder
                 if (data[i] == TdsConstants.TokenDone || data[i] == TdsConstants.TokenDoneProc || data[i] == TdsConstants.TokenDoneInProc)
                 {
                     if (i + 13 <= data.Length)
+                        return i;
+                }
+                else if (data[i] == TdsConstants.TokenReturnStatus)
+                {
+                    if (i + 5 <= data.Length)
                         return i;
                 }
                 else if (data[i] == TdsConstants.TokenColMetadata)

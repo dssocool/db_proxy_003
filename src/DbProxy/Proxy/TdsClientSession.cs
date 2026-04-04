@@ -23,6 +23,7 @@ public sealed class TdsClientSession : IAsyncDisposable
     private readonly LoginHandler _login;
     private readonly QueryHandler _queryHandler;
     private readonly ResponseBuilder _responseBuilder;
+    private readonly RpcHandler _rpcHandler;
     private SqlConnection? _backendConnection;
     private string _database = "";
     private int _packetSize = TdsConstants.DefaultPacketSize;
@@ -42,6 +43,7 @@ public sealed class TdsClientSession : IAsyncDisposable
         _login = new LoginHandler(loggerFactory.CreateLogger<LoginHandler>());
         _queryHandler = new QueryHandler(loggerFactory.CreateLogger<QueryHandler>());
         _responseBuilder = new ResponseBuilder(loggerFactory.CreateLogger<ResponseBuilder>());
+        _rpcHandler = new RpcHandler(loggerFactory.CreateLogger<RpcHandler>(), _responseBuilder);
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -215,6 +217,12 @@ public sealed class TdsClientSession : IAsyncDisposable
                     _logger.LogDebug("Query #{Num}: Response sent", queryNum);
                     break;
 
+                case TdsConstants.PacketTypeRpcRequest:
+                    _logger.LogDebug("Query #{Num}: RPC_REQUEST ({Len} bytes payload)", queryNum, payload.Length);
+                    await HandleRpcRequestAsync(payload, ct);
+                    _logger.LogDebug("Query #{Num}: RPC response sent", queryNum);
+                    break;
+
                 case TdsConstants.PacketTypeAttention:
                     _logger.LogDebug("Query #{Num}: Received ATTENTION signal, sending empty DONE", queryNum);
                     await SendDoneAsync(TdsConstants.DoneFinal, 0, ct);
@@ -227,6 +235,21 @@ public sealed class TdsClientSession : IAsyncDisposable
                     break;
             }
         }
+    }
+
+    private async Task HandleRpcRequestAsync(byte[] payload, CancellationToken ct)
+    {
+        if (_backendConnection is null || _backendConnection.State != System.Data.ConnectionState.Open)
+        {
+            _logger.LogWarning("Backend connection not available for RPC (State={State})",
+                _backendConnection?.State.ToString() ?? "null");
+            await SendErrorAndDoneAsync("Backend connection is not available", ct);
+            return;
+        }
+
+        byte[] response = await _rpcHandler.HandleRpcAsync(payload, _backendConnection, ct);
+        _logger.LogDebug("RPC response built: {Len} bytes", response.Length);
+        await _writer.WriteMessageAsync(TdsConstants.PacketTypeTabularResult, response, ct);
     }
 
     private async Task HandleSqlBatchAsync(byte[] payload, CancellationToken ct)

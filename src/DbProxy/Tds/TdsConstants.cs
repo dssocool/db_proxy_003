@@ -40,6 +40,8 @@ public static class TdsConstants
     public const byte EncryptRequired = 0x03;
 
     // Token types (server -> client)
+    public const byte TokenReturnStatus = 0x79;
+    public const byte TokenReturnValue = 0xAC;
     public const byte TokenError = 0xAA;
     public const byte TokenLoginAck = 0xAD;
     public const byte TokenEnvChange = 0xE3;
@@ -50,6 +52,13 @@ public static class TdsConstants
     public const byte TokenRow = 0xD1;
     public const byte TokenInfo = 0xAB;
     public const byte TokenOrder = 0xA9;
+
+    // Well-known RPC ProcIDs (used when NameLenProcID starts with 0xFFFF)
+    public const ushort SpExecuteSql = 10;
+    public const ushort SpPrepare = 11;
+    public const ushort SpExecute = 12;
+    public const ushort SpPrepExec = 13;
+    public const ushort SpUnprepare = 15;
 
     // ENVCHANGE types
     public const byte EnvDatabase = 1;
